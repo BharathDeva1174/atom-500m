@@ -193,13 +193,21 @@ model.
 
 ### Checkpoints
 
-Evaluated every 100 steps and checkpointed every 500, then uploaded to the Hub
-**from a background thread** so a slow network never stalls a training step.
+Evaluated and checkpointed every 500 steps, then uploaded to the Hub **from a
+background thread** so a slow network never stalls a training step.
 
 ```
+step 500 | eval 3.4172
 [ckpt] step 500 saved (5572 MB) in 22.1s    <- on the training thread
 [upload] step_500.pt -> checkpoints/step_500.pt (84.3s)   <- on the uploader
 ```
+
+The two cadences are deliberately aligned. Each checkpoint interval then carries
+exactly one evaluation, and the checkpoint records the eval loss measured at that
+same step rather than one up to 400 steps stale. It also removes a second,
+offset-triggered synchronization point: the two remain distinct collectives (eval
+all-reduces a loss statistic, the checkpoint a status flag), but they now fire
+together once per interval instead of at two interleaved offsets.
 
 **A checkpoint is ~5.6 GiB, not ~2 GB.** Measured at 12 bytes/parameter: fp32
 weights 1.85 GiB plus *two* AdamW states (`exp_avg` and `exp_avg_sq`) at 1.85 GiB
@@ -209,7 +217,7 @@ each. At `SAVE_EVERY=100` on Kaggle's ~20 GB disk, the last **2** checkpoints
 | Variable | Default | Notes |
 |---|---|---|
 | `ATOM_SAVE_EVERY` | 500 | Steps between checkpoints. At 100 the upload rate is 5× higher and saturates a residential connection; 500 costs at most 500 steps of progress on a hard kill. |
-| `ATOM_EVAL_EVERY` | 100 | Steps between evaluations. Cheap — no disk cost. |
+| `ATOM_EVAL_EVERY` | 500 | Steps between evaluations. Aligned with `ATOM_SAVE_EVERY` so each interval carries one eval and the checkpoint records it. |
 | `ATOM_UPLOAD_QUEUE` | 3 | Max unsent checkpoints before the oldest is dropped. |
 | `ATOM_UPLOAD_JOIN_TIMEOUT` | 300 | Seconds to wait for the queue at exit. |
 | `ATOM_KEEP_LOCAL_COUNT` | 2 | Uploaded checkpoints retained on disk. |

@@ -74,12 +74,14 @@ def build_checkpoint(
     step: int,
     config: Optional[dict] = None,
     loss: Optional[float] = None,
+    eval_loss: Optional[float] = None,
 ) -> dict:
     """Assemble the checkpoint dict. Exposed separately so tests can inspect
     the contents without touching the filesystem.
 
-    `loss` is the most recent training loss, recorded so a resumed run can be
-    sanity-checked against the run that produced it.
+    `loss` is the most recent training loss and `eval_loss` the held-out loss
+    measured at this step, so a resumed run can be sanity-checked against the
+    run that produced it.
     """
     module = _unwrap(model)
     return {
@@ -90,6 +92,7 @@ def build_checkpoint(
         ),
         "config": config,
         "loss": loss,
+        "eval_loss": eval_loss,
         "saved_at": time.time(),
     }
 
@@ -100,6 +103,7 @@ def save_local_checkpoint(
     step: int,
     config: Optional[dict] = None,
     loss: Optional[float] = None,
+    eval_loss: Optional[float] = None,
     checkpoint_dir: str = CHECKPOINT_DIR,
 ) -> Optional[str]:
     """Write a checkpoint to disk and return its path, or None on failure.
@@ -115,7 +119,10 @@ def save_local_checkpoint(
     os.makedirs(checkpoint_dir, exist_ok=True)
     path = os.path.join(checkpoint_dir, f"step_{step}.pt")
     try:
-        torch.save(build_checkpoint(model, optimizer, step, config, loss), path)
+        torch.save(
+            build_checkpoint(model, optimizer, step, config, loss, eval_loss),
+            path,
+        )
     except Exception as exc:
         print(f"[sync] ERROR: local save failed at step {step}: {exc}")
         return None

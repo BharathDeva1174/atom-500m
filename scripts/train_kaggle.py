@@ -94,7 +94,14 @@ WARMUP_STEPS = int(os.environ.get("ATOM_WARMUP", 200))
 WEIGHT_DECAY = float(os.environ.get("ATOM_WD", 0.1))
 GRAD_CLIP = 1.0
 LOG_EVERY = int(os.environ.get("ATOM_LOG_EVERY", 20))
-EVAL_EVERY = int(os.environ.get("ATOM_EVAL_EVERY", 100))
+# Evaluation is aligned with checkpointing (both every 500 steps) so each
+# checkpoint interval carries exactly one eval. They are separate collectives:
+# eval all-reduces a loss statistic, the checkpoint all-reduces a status flag.
+# Running both at one cadence means two barriers per interval instead of a
+# second, offset-triggered sync -- the alignment removes a synchronization point
+# rather than adding one. It also means the eval loss is available to record in
+# the same checkpoint, instead of being stale by up to 400 steps.
+EVAL_EVERY = int(os.environ.get("ATOM_EVAL_EVERY", 500))
 EVAL_BATCHES = int(os.environ.get("ATOM_EVAL_BATCHES", 20))
 # Every 500 steps. A 497M checkpoint is ~5.6 GiB (fp32 weights 1.85 + AdamW
 # exp_avg 1.85 + exp_avg_sq 1.85, i.e. 12 bytes/param), so this is a real
@@ -622,8 +629,8 @@ def maybe_resume() -> Optional[str]:
 _LAST_SAVED_STEP = [-1]
 
 
-def checkpoint(model, optimizer, step, config, loss=None, uploader=None,
-               device=None) -> None:
+def checkpoint(model, optimizer, step, config, loss=None, eval_loss=None,
+               uploader=None, device=None) -> None:
     """Save on rank 0, enqueue for upload, then every rank crosses the barrier.
 
     The work is rank-0-only but the `all_reduce` is not: an earlier version
@@ -645,7 +652,7 @@ def checkpoint(model, optimizer, step, config, loss=None, uploader=None,
         t0 = time.time()
         path = save_local_checkpoint(
             model, optimizer, step, config=config, loss=loss,
-            checkpoint_dir=CHECKPOINT_DIR,
+            eval_loss=eval_loss, checkpoint_dir=CHECKPOINT_DIR,
         )
         ok = path is not None
         if path:
@@ -775,6 +782,7 @@ def main() -> None:
         log("[resume] no prior checkpoint — starting from step 0")
 
     last_loss = None
+    last_eval = None
     try:
         # Resume lands mid-epoch when steps_per_epoch does not divide the saved
         # step. `skip_micro` counts the batches already consumed inside the
@@ -837,11 +845,17 @@ def main() -> None:
                     running = t0 = 0.0
 
                 if step % EVAL_EVERY == 0:
-                    log(f"step {step} | eval {evaluate(ddp_model, eval_loader, device, amp, EVAL_BATCHES):.4f}")
+                    eval_loss = evaluate(ddp_model, eval_loader, device, amp,
+                                         EVAL_BATCHES)
+                    last_eval = eval_loss
+                    log(f"step {step} | eval {eval_loss:.4f}")
 
                 if step % SAVE_EVERY == 0:
+                    # Runs after eval on a shared cadence, so the checkpoint
+                    # records the eval loss measured at this exact step.
                     checkpoint(ddp_model, optimizer, step, config,
-                               loss=last_loss, uploader=uploader, device=device)
+                               loss=last_loss, eval_loss=last_eval,
+                               uploader=uploader, device=device)
 
                 if MAX_STEPS and step >= MAX_STEPS:
                     break
@@ -849,18 +863,21 @@ def main() -> None:
                 break
 
         checkpoint(ddp_model, optimizer, step, config,
-                   loss=last_loss, uploader=uploader, device=device)
+                   loss=last_loss, eval_loss=last_eval,
+                   uploader=uploader, device=device)
         log(f"[done] {step:,} steps complete")
 
     except KeyboardInterrupt:
         log("[interrupt] checkpointing before exit")
         checkpoint(ddp_model, optimizer, step, config,
-                   loss=last_loss, uploader=uploader, device=device)
+                   loss=last_loss, eval_loss=last_eval,
+                   uploader=uploader, device=device)
         raise
     except Exception as exc:
         log(f"[error] {type(exc).__name__}: {exc}")
         checkpoint(ddp_model, optimizer, step, config,
-                   loss=last_loss, uploader=uploader, device=device)
+                   loss=last_loss, eval_loss=last_eval,
+                   uploader=uploader, device=device)
         raise
     finally:
         # Drain the upload queue BEFORE tearing anything down. A daemon thread is

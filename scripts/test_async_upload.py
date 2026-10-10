@@ -193,6 +193,9 @@ def test_checkpoint_contents():
     m = Atom500M(cfg)
     opt = torch.optim.AdamW(m.parameters(), lr=1e-4)
 
+    def T_load(path):
+        return torch.load(path, map_location="cpu", weights_only=False)
+
     with tempfile.TemporaryDirectory() as td:
         path = save_local_checkpoint(m, opt, step=7, config=cfg, loss=1.2345,
                                      checkpoint_dir=td)
@@ -213,9 +216,74 @@ def test_checkpoint_contents():
               ckpt["model"]["lm_head.weight"].untyped_storage().data_ptr()
               == ckpt["model"]["wte.weight"].untyped_storage().data_ptr())
 
+        # eval_loss rides along so a resumed run can compare against the same
+        # held-out measurement the producing run recorded.
+        p2 = save_local_checkpoint(m, opt, step=8, config=cfg, loss=0.9,
+                                   eval_loss=0.75, checkpoint_dir=td)
+        ck2 = T_load(p2)
+        check("eval_loss recorded", abs(ck2["eval_loss"] - 0.75) < 1e-9,
+              str(ck2.get("eval_loss")))
+        check("loss and eval_loss are separate fields",
+              abs(ck2["loss"] - 0.9) < 1e-9, str(ck2.get("loss")))
+
+
+def test_eval_save_alignment():
+    """EVAL_EVERY and SAVE_EVERY should coincide, by design.
+
+    Aligned, each checkpoint interval carries exactly one eval, and the eval
+    loss measured at that step is available to the checkpoint written right
+    after it. Misaligned, the recorded eval is stale by up to a full interval.
+    """
+    import train_kaggle as K
+
+    print("\n[eval/checkpoint alignment]")
+    check("EVAL_EVERY == SAVE_EVERY", K.EVAL_EVERY == K.SAVE_EVERY,
+          f"eval={K.EVAL_EVERY} save={K.SAVE_EVERY}")
+    check("both are 500 by default", K.EVAL_EVERY == 500 and K.SAVE_EVERY == 500,
+          f"eval={K.EVAL_EVERY} save={K.SAVE_EVERY}")
+
+    # The loop must run eval before checkpoint on a shared step, otherwise the
+    # checkpoint records the previous interval's eval.
+    import io as _io
+    src = _io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "train_kaggle.py"), encoding="utf-8").read()
+    i_eval = src.find("if step % EVAL_EVERY == 0:")
+    i_save = src.find("if step % SAVE_EVERY == 0:")
+    check("both cadence checks exist", i_eval > 0 and i_save > 0)
+    check("eval runs before checkpoint in the loop", 0 < i_eval < i_save,
+          f"eval@{i_eval} save@{i_save}")
+    check("checkpoint receives the eval loss",
+          "eval_loss=last_eval" in src)
+
+
+def test_round_trip_into_model():
+    """The saved checkpoint must load back into a live model unchanged."""
+    import torch as T
+
+    import train_kaggle as K
+    from src.model import Atom500M
+    from src.sync import load_checkpoint, save_local_checkpoint
+
+    print("\n[checkpoint round trip]")
+    cfg = {"vocab_size": 512, "d_model": 64, "n_head": 4, "n_layer": 2,
+           "block_size": 32, "ff_expansion": 3.5}
+    m = Atom500M(cfg)
+    opt = T.optim.AdamW(m.parameters(), lr=1e-4)
+    # Train briefly so the saved weights are not the initial ones.
+    for _ in range(3):
+        idx = T.randint(0, 512, (2, 16))
+        m(idx, T.randint(0, 512, (2, 16))).backward()
+        opt.step()
+        opt.zero_grad()
+
+    with tempfile.TemporaryDirectory() as td:
+        p = save_local_checkpoint(m, opt, step=7, config=cfg, loss=1.2345,
+                                 eval_loss=0.99, checkpoint_dir=td)
+        check("file written", p is not None and os.path.exists(p))
+
         # And it round-trips back into a live model.
         m2 = Atom500M(cfg)
-        step = load_checkpoint(path, m2, opt)
+        step = load_checkpoint(p, m2, opt)
         check("reload restores step", step == 7, str(step))
         # Assert the tie by shared storage, not object identity:
         # `state_dict()` returns fresh `detach()` views, so `is` is False even
@@ -238,6 +306,8 @@ if __name__ == "__main__":
     test_close_drains()
     test_close_timeout()
     test_checkpoint_contents()
+    test_round_trip_into_model()
+    test_eval_save_alignment()
     print("\n" + "=" * 66)
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): " + ", ".join(FAILURES))
