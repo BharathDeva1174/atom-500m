@@ -30,9 +30,12 @@ import contextlib
 import json
 import math
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -47,6 +50,7 @@ from src.model import Atom500M, load_config  # noqa: E402
 from src.sync import (  # noqa: E402
     cleanup_stale_checkpoints,
     save_and_push_checkpoint,
+    save_local_checkpoint,
 )
 
 
@@ -93,6 +97,12 @@ SAVE_EVERY = int(os.environ.get("ATOM_SAVE_EVERY", 500))
 MAX_STEPS = int(os.environ.get("ATOM_MAX_STEPS", 0))        # 0 = one epoch
 DOWNLOAD = os.environ.get("ATOM_DOWNLOAD", "1") == "1"
 GRAD_CHECKPOINTING = os.environ.get("ATOM_GRAD_CHECKPOINT", "0") == "1"
+# Background upload: how many checkpoints may be queued unsent, and how long
+# shutdown waits for the queue to drain. The bound caps disk use if the network
+# is slower than training; the timeout stops a hung upload from blocking exit.
+UPLOAD_QUEUE = int(os.environ.get("ATOM_UPLOAD_QUEUE", 3))
+UPLOAD_JOIN_TIMEOUT = float(os.environ.get("ATOM_UPLOAD_JOIN_TIMEOUT", 300.0))
+DELETE_AFTER_UPLOAD = os.environ.get("ATOM_KEEP_LOCAL", "0") != "1"
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
@@ -373,31 +383,213 @@ def evaluate(model, loader, device, amp, max_batches: int) -> float:
     return float(stats[0] / stats[1].clamp(min=1.0))
 
 
-def checkpoint(model, optimizer, step, config) -> None:
-    """Rank-0 saves and uploads, then every rank crosses the barrier.
+class AsyncUploader:
+    """Upload checkpoints from a background thread so training never stalls.
+
+    The training loop calls `submit()`, which enqueues a path and returns
+    immediately. A single daemon thread drains the queue, so a slow or failing
+    upload cannot block a step -- the thing that matters on a 12-hour Kaggle
+    session with a ~2 GB file on a residential connection.
+
+    **Backpressure.** The queue is bounded. If uploads fall behind (poor
+    network), a growing queue would fill the disk with unsent checkpoints and
+    eventually kill the run. When the bound is hit, the *oldest* pending upload
+    is dropped and its file deleted: recent checkpoints are the valuable ones,
+    and the model is still moving forward.
+
+    **Shutdown.** `close()` drains the queue before returning, so a checkpoint
+    submitted just before exit actually gets uploaded. The main thread joins
+    with a timeout, because a hung upload must not hang the process forever --
+    that is how a completed run turns into a lost session.
+    """
+
+    def __init__(
+        self,
+        repo_id: str,
+        token: Optional[str] = None,
+        path_in_repo: str = "checkpoints",
+        max_pending: int = 3,
+        delete_after: bool = True,
+    ):
+        self.repo_id = repo_id
+        self.token = token
+        self.path_in_repo = path_in_repo
+        self.max_pending = max_pending
+        self.delete_after = delete_after
+
+        self._queue: "queue.Queue" = queue.Queue(maxsize=max_pending)
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._stopped = threading.Event()
+        self._lock = threading.Lock()
+        self.uploaded = 0
+        self.failed = 0
+        self.dropped = 0
+
+    # -- lifecycle ----------------------------------------------------------
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._worker, name="ckpt-uploader", daemon=True
+        )
+        self._thread.start()
+        print(f"[upload] background uploader -> {self.repo_id}/{self.path_in_repo}/")
+
+    def close(self, timeout: float = 300.0) -> None:
+        """Drain the queue, join the thread, and report."""
+        self._stop.set()
+        if self._thread is not None:
+            # Join with a bounded timeout: an in-flight upload can hang, and a
+            # finished training run must not be held hostage by the network.
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                print(f"[upload] WARNING: uploader still running after "
+                      f"{timeout:.0f}s; exiting with uploads in flight")
+            self._thread = None
+        with self._lock:
+            print(f"[upload] finished: {self.uploaded} uploaded, "
+                  f"{self.failed} failed, {self.dropped} dropped")
+
+    # -- producer -----------------------------------------------------------
+    def submit(self, path: str) -> None:
+        """Enqueue a checkpoint. Returns immediately, never raises."""
+        if path is None or self._thread is None:
+            return
+        try:
+            self._queue.put_nowait(path)
+        except queue.Full:
+            # Drop the oldest: recent checkpoints matter more than stale ones.
+            try:
+                old = self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                old = None
+            if old:
+                self.dropped += 1
+                print(f"[upload] queue full; dropping {os.path.basename(old)}")
+                _quiet_remove(old)
+            try:
+                self._queue.put_nowait(path)
+            except queue.Full:
+                self.dropped += 1
+                _quiet_remove(path)
+
+    def pending(self) -> int:
+        return self._queue.qsize()
+
+    # -- consumer -----------------------------------------------------------
+    def _worker(self) -> None:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=self.token)
+        except Exception as exc:
+            print(f"[upload] disabled: {type(exc).__name__}: {exc}")
+            self._stopped.set()
+            return
+
+        while True:
+            try:
+                # A short timeout keeps the thread responsive to close() instead
+                # of blocking on an empty queue.
+                path = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
+
+            try:
+                name = os.path.basename(path)
+                remote = f"{self.path_in_repo}/{name}"
+                t0 = time.time()
+                api.upload_file(
+                    path_or_fileobj=path,
+                    path_in_repo=remote,
+                    repo_id=self.repo_id,
+                    commit_message=f"checkpoint {name}",
+                )
+                with self._lock:
+                    self.uploaded += 1
+                print(f"[upload] {name} -> {remote} ({time.time() - t0:.1f}s)")
+                if self.delete_after:
+                    _quiet_remove(path)
+            except Exception as exc:
+                # A failed upload must not kill the thread: the run should
+                # continue and keep checkpointing.
+                with self._lock:
+                    self.failed += 1
+                print(f"[upload] FAILED {os.path.basename(path)}: "
+                      f"{type(exc).__name__}: {exc}")
+            finally:
+                self._queue.task_done()
+
+
+def _quiet_remove(path: str) -> None:
+    """Delete a file, ignoring failure. Windows can hold locks transiently."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+# Last step written by `checkpoint`, so a shutdown save at the same step as the
+# scheduled one is a no-op rather than a duplicate ~2 GB upload. A one-element
+# list rather than a global, so it resets cleanly per process.
+_LAST_SAVED_STEP = [-1]
+
+
+def checkpoint(model, optimizer, step, config, loss=None, uploader=None) -> None:
+    """Save on rank 0, enqueue for upload, then every rank crosses the barrier.
 
     The work is rank-0-only but the `all_reduce` is not: an earlier version
     early-returned on non-zero ranks, so rank 0 blocked forever on a partner
     that had already left, and the job died silently at the first checkpoint.
     On a 12-hour Kaggle session that means losing everything.
-    """
-    path = None
-    if is_main():
-        if not HF_TOKEN:
-            print("[ckpt] no HF_TOKEN — saving locally only")
-        t0 = time.time()
-        path = save_and_push_checkpoint(
-            model, optimizer, step, repo_id=HF_REPO,
-            token=HF_TOKEN or None, config=config,
-            checkpoint_dir=CHECKPOINT_DIR, keep_local=not HF_TOKEN,
-        )
-        if path:
-            log(f"[ckpt] step {step} saved in {time.time() - t0:.1f}s -> {path}")
 
-    status = torch.tensor([0 if path else 1], dtype=torch.int32)
+    The save stays on this thread (see `save_local_checkpoint` for why) and
+    only the upload is handed to the background thread.
+
+    Idempotent per step. Training that ends exactly on a SAVE_EVERY boundary
+    hits this twice -- once from the schedule, once from shutdown -- which would
+    write the same ~2 GB file again and push a duplicate commit to the Hub. The
+    step number is the natural key for "already saved".
+    """
+    already_saved = _LAST_SAVED_STEP[0] == step
+
+    if is_main() and not already_saved:
+        t0 = time.time()
+        path = save_local_checkpoint(
+            model, optimizer, step, config=config, loss=loss,
+            checkpoint_dir=CHECKPOINT_DIR,
+        )
+        ok = path is not None
+        if path:
+            size_mb = os.path.getsize(path) / 1024**2
+            log(f"[ckpt] step {step} saved ({size_mb:.0f} MB) "
+                f"in {time.time() - t0:.1f}s")
+            if uploader is not None:
+                uploader.submit(path)
+            elif not HF_TOKEN:
+                # No uploader and no token: the local copy is the only one, so
+                # it must not be deleted.
+                print("[ckpt] no uploader and no HF_TOKEN — kept locally")
+            else:
+                # Synchronous fallback: correctness over speed.
+                save_and_push_checkpoint(
+                    model, optimizer, step, repo_id=HF_REPO, token=HF_TOKEN,
+                    config=config, checkpoint_dir=CHECKPOINT_DIR,
+                )
+    else:
+        ok = already_saved
+
+    # Every rank reaches the barrier exactly once, including on a skipped save.
+    status = torch.tensor([0 if ok else 1], dtype=torch.int32)
     dist.all_reduce(status, op=dist.ReduceOp.MIN)
     if int(status.item()) == 1:
-        log("[ckpt] WARNING: checkpoint failed on rank 0 — this step is not recoverable")
+        log("[ckpt] WARNING: local save failed on rank 0 — "
+            "this step is not recoverable")
+    if is_main() and ok:
+        _LAST_SAVED_STEP[0] = step
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +635,19 @@ def main() -> None:
     log(f"[train] {steps_per_epoch} steps/epoch | total {total_steps:,} | "
         f"effective batch ~{eff_tokens:,} tokens")
 
+    # The uploader only ever runs on rank 0. Starting it on every rank would
+    # have each rank uploading the same file.
+    uploader = None
+    if is_main() and HF_TOKEN:
+        uploader = AsyncUploader(
+            repo_id=HF_REPO, token=HF_TOKEN, path_in_repo="checkpoints",
+            max_pending=UPLOAD_QUEUE, delete_after=DELETE_AFTER_UPLOAD,
+        )
+        uploader.start()
+    elif is_main():
+        log("[ckpt] no HF_TOKEN — checkpoints stay local (no background upload)")
+
+    last_loss = None
     step = 0
     try:
         for epoch in range(10_000 if not MAX_STEPS else 1):
@@ -459,6 +664,7 @@ def main() -> None:
                     loss = ddp_model(x, y)
                 scaler.scale(loss / GRAD_ACCUM).backward()
                 running += loss.item()
+                last_loss = loss.item()
 
                 if (it + 1) % GRAD_ACCUM:
                     continue
@@ -495,25 +701,35 @@ def main() -> None:
                     log(f"step {step} | eval {evaluate(ddp_model, eval_loader, device, amp, EVAL_BATCHES):.4f}")
 
                 if step % SAVE_EVERY == 0:
-                    checkpoint(ddp_model, optimizer, step, config)
+                    checkpoint(ddp_model, optimizer, step, config,
+                               loss=last_loss, uploader=uploader)
 
                 if MAX_STEPS and step >= MAX_STEPS:
                     break
             if MAX_STEPS and step >= MAX_STEPS:
                 break
 
-        checkpoint(ddp_model, optimizer, step, config)
+        checkpoint(ddp_model, optimizer, step, config,
+                   loss=last_loss, uploader=uploader)
         log(f"[done] {step:,} steps complete")
 
     except KeyboardInterrupt:
         log("[interrupt] checkpointing before exit")
-        checkpoint(ddp_model, optimizer, step, config)
+        checkpoint(ddp_model, optimizer, step, config,
+                   loss=last_loss, uploader=uploader)
         raise
     except Exception as exc:
         log(f"[error] {type(exc).__name__}: {exc}")
-        checkpoint(ddp_model, optimizer, step, config)
+        checkpoint(ddp_model, optimizer, step, config,
+                   loss=last_loss, uploader=uploader)
         raise
     finally:
+        # Drain the upload queue BEFORE tearing anything down. A daemon thread is
+        # killed at interpreter exit, so a checkpoint submitted moments earlier
+        # would never reach the Hub -- and the run would be "successful" with
+        # its final weights missing.
+        if uploader is not None:
+            uploader.close(timeout=UPLOAD_JOIN_TIMEOUT)
         train_ds.close()
         if dist.is_initialized():
             dist.destroy_process_group()

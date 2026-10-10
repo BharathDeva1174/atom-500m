@@ -193,11 +193,40 @@ model.
 
 ### Checkpoints
 
-Save locally → upload to the Hub → **delete the local copy**. Kaggle gives ~20 GB
-and kills sessions without warning, so disk stays flat regardless of run length.
-Uploads are best-effort: a failure logs and continues rather than killing a run
-that is hours in. `NOTES.md` §5 covers the two subtleties (weight-tying
-preservation, non-persistent buffers).
+Saved every 500 steps, then uploaded to the Hub **from a background thread** so
+a slow network never stalls a training step.
+
+```
+[ckpt] step 500 saved (2000 MB) in 8.3s     <- on the training thread
+[upload] step_500.pt -> checkpoints/step_500.pt (42.1s)   <- on the uploader
+```
+
+**Only the save is synchronous.** `torch.save` reads tensors the training loop
+is concurrently mutating — the optimizer state especially — so serializing it
+off-thread risks writing a *torn* checkpoint: a file that loads without error
+but whose optimizer state is half from step N and half from step N+1. The save
+stays on the main thread to make the snapshot consistent; only the network wait,
+which is the slow and variable part, moves off.
+
+**The queue is bounded** (default 3). If uploads fall behind, the *oldest*
+pending upload is dropped and its file deleted — recent checkpoints are the
+valuable ones, and an unbounded queue would fill Kaggle's disk and kill the run.
+
+**Shutdown drains the queue** with a bounded timeout. A daemon thread is killed
+at interpreter exit, so without this a checkpoint submitted moments before
+completion would never reach the Hub, and the run would report success with its
+final weights missing. A *hung* upload can't block exit either.
+
+A failed upload is logged and the thread keeps going — the run continues and
+keeps checkpointing.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ATOM_UPLOAD_QUEUE` | 3 | Max unsent checkpoints before the oldest is dropped. |
+| `ATOM_UPLOAD_JOIN_TIMEOUT` | 300 | Seconds to wait for the queue at exit. |
+| `ATOM_KEEP_LOCAL` | 0 | Set 1 to keep checkpoints on disk after upload. |
+
+Without `HF_TOKEN`, checkpoints stay local and nothing is uploaded.
 
 ## Testing
 
