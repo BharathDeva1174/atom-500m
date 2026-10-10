@@ -202,6 +202,104 @@ def save_and_push_checkpoint(
     return f"{repo_id}/{remote_path}"
 
 
+def find_latest_checkpoint(
+    checkpoint_dir: str = CHECKPOINT_DIR,
+    pattern: str = "step_*.pt",
+) -> Optional[str]:
+    """Return the path of the highest-stepped checkpoint, or None.
+
+    Filenames sort lexicographically, so `step_999.pt` would win over
+    `step_1000.pt`. The step is parsed as an integer rather than compared as a
+    string, which is the difference between resuming from 999 and resuming
+    from the 1000 you actually want.
+    """
+    if not os.path.isdir(checkpoint_dir):
+        return None
+
+    best, best_step = None, -1
+    for name in os.listdir(checkpoint_dir):
+        if not (name.startswith("step_") and name.endswith(".pt")):
+            continue
+        try:
+            step = int(name[5:-3])
+        except ValueError:
+            continue
+        if step > best_step:
+            best, best_step = os.path.join(checkpoint_dir, name), step
+    return best
+
+
+def download_latest_checkpoint(
+    repo_id: str,
+    token: Optional[str] = None,
+    checkpoint_dir: str = CHECKPOINT_DIR,
+    path_in_repo: str = "checkpoints",
+    cache_dir: Optional[str] = None,
+) -> Optional[str]:
+    """Fetch the highest-stepped remote checkpoint and return a local path.
+
+    Lists the repo rather than guessing a step number, because the run that
+    produced it may have stopped anywhere. Returns None when there is nothing
+    to resume from -- a first run, not an error.
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("huggingface_hub is required to resume from the Hub") from exc
+
+    api = HfApi(token=token)
+    try:
+        files = api.list_repo_files(repo_id, repo_type="model")
+    except Exception as exc:
+        print(f"[sync] could not list {repo_id}: {type(exc).__name__}: {exc}")
+        return None
+
+    prefix = f"{path_in_repo}/step_"
+    best, best_step = None, -1
+    for f in files:
+        if not (f.startswith(prefix) and f.endswith(".pt")):
+            continue
+        try:
+            step = int(f[len(prefix):-3])
+        except ValueError:
+            continue
+        if step > best_step:
+            best, best_step = f, step
+
+    if best is None:
+        print(f"[sync] no checkpoints under {path_in_repo}/ in {repo_id}")
+        return None
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    local = os.path.join(checkpoint_dir, f"step_{best_step}.pt")
+    if os.path.exists(local):
+        print(f"[sync] using local copy of step_{best_step}.pt")
+        return local
+
+    print(f"[sync] downloading {best} from {repo_id} ...")
+    try:
+        from huggingface_hub import hf_hub_download
+
+        got = hf_hub_download(
+            repo_id=repo_id, filename=best, token=token,
+            cache_dir=cache_dir, local_dir=checkpoint_dir,
+        )
+    except Exception as exc:
+        print(f"[sync] download failed: {type(exc).__name__}: {exc}")
+        return None
+
+    # local_dir can nest the repo path; normalize to the flat name we expect.
+    if os.path.abspath(got) != os.path.abspath(local) and os.path.exists(got):
+        try:
+            if os.path.exists(local):
+                os.remove(local)
+            os.replace(got, local)
+        except OSError as exc:
+            print(f"[sync] WARNING: could not move download into place: {exc}")
+            return got
+    return local
+
+
 def load_checkpoint(
     path: str,
     model: torch.nn.Module,

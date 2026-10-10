@@ -49,6 +49,9 @@ from src.dataset import ShardedMemmapDataset, collate  # noqa: E402
 from src.model import Atom500M, load_config  # noqa: E402
 from src.sync import (  # noqa: E402
     cleanup_stale_checkpoints,
+    download_latest_checkpoint,
+    find_latest_checkpoint,
+    load_checkpoint,
     save_and_push_checkpoint,
     save_local_checkpoint,
 )
@@ -364,6 +367,13 @@ def evaluate(model, loader, device, amp, max_batches: int) -> float:
 
     Averaging per-rank means would over-weight whichever rank ran fewer batches;
     summing (loss_sum, count) and dividing at the end is the true mean.
+
+    The reduction tensor MUST live on the training device. NCCL — the backend
+    for a CUDA run — cannot reduce CPU tensors and raises
+    "No backend type associated with device type cpu". Gloo accepts CPU
+    tensors, which is why this only ever shows up on GPU. Following the
+    training device works under both backends; hardcoding CPU works under gloo
+    and crashes under nccl.
     """
     model.eval()
     loss_sum = n_batches = 0.0
@@ -376,11 +386,11 @@ def evaluate(model, loader, device, amp, max_batches: int) -> float:
             loss_sum += model(x, y).item()
         n_batches += 1
 
-    stats = torch.tensor([loss_sum, n_batches], dtype=torch.float64)
+    stats = torch.tensor([loss_sum, n_batches], dtype=torch.float64, device=device)
     if dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
     model.train()
-    return float(stats[0] / stats[1].clamp(min=1.0))
+    return float(stats[0].item() / stats[1].clamp(min=1.0).item())
 
 
 class AsyncUploader:
@@ -532,13 +542,51 @@ def _quiet_remove(path: str) -> None:
         pass
 
 
+def maybe_resume() -> Optional[str]:
+    """Locate a checkpoint to resume from, or None to start fresh.
+
+    Order: an explicit ATOM_RESUME path, then a local checkpoint, then the Hub.
+    Local is preferred over remote because on Kaggle the two are usually the
+    same file, and reading local avoids a multi-GB download.
+
+    A corrupt or unreadable local checkpoint falls through to the next source
+    rather than aborting: on a restarted notebook the file on disk is more
+    likely to be a partial write than a real resume point, and refusing to
+    start would waste the whole session.
+    """
+    explicit = os.environ.get("ATOM_RESUME", "")
+    if explicit:
+        if os.path.exists(explicit):
+            return explicit
+        print(f"[resume] ATOM_RESUME={explicit} not found; searching instead")
+
+    local = find_latest_checkpoint(CHECKPOINT_DIR)
+    if local:
+        return local
+
+    if os.environ.get("ATOM_NO_DOWNLOAD_RESUME", "0") == "1":
+        return None
+
+    try:
+        return download_latest_checkpoint(
+            HF_REPO, token=HF_TOKEN or None, checkpoint_dir=CHECKPOINT_DIR
+        )
+    except Exception as exc:
+        # A resume failure must never be fatal: training from scratch beats
+        # not training at all.
+        print(f"[resume] remote lookup failed ({type(exc).__name__}: {exc}); "
+              f"starting from step 0")
+        return None
+
+
 # Last step written by `checkpoint`, so a shutdown save at the same step as the
 # scheduled one is a no-op rather than a duplicate ~2 GB upload. A one-element
 # list rather than a global, so it resets cleanly per process.
 _LAST_SAVED_STEP = [-1]
 
 
-def checkpoint(model, optimizer, step, config, loss=None, uploader=None) -> None:
+def checkpoint(model, optimizer, step, config, loss=None, uploader=None,
+               device=None) -> None:
     """Save on rank 0, enqueue for upload, then every rank crosses the barrier.
 
     The work is rank-0-only but the `all_reduce` is not: an earlier version
@@ -583,7 +631,11 @@ def checkpoint(model, optimizer, step, config, loss=None, uploader=None) -> None
         ok = already_saved
 
     # Every rank reaches the barrier exactly once, including on a skipped save.
-    status = torch.tensor([0 if ok else 1], dtype=torch.int32)
+    # The status tensor follows the training device: nccl cannot reduce CPU
+    # tensors, so a hardcoded CPU tensor crashes every checkpoint on GPU.
+    # Keeping the collective on the accelerator also makes it a device sync
+    # point, so the enqueue below cannot race the next step's kernels.
+    status = torch.tensor([0 if ok else 1], dtype=torch.int32, device=device)
     dist.all_reduce(status, op=dist.ReduceOp.MIN)
     if int(status.item()) == 1:
         log("[ckpt] WARNING: local save failed on rank 0 — "
@@ -647,16 +699,59 @@ def main() -> None:
     elif is_main():
         log("[ckpt] no HF_TOKEN — checkpoints stay local (no background upload)")
 
-    last_loss = None
+    # --- resume -------------------------------------------------------------
+    # Every rank must agree on the starting step: they share a sampler, and a
+    # disagreement would feed different data to different GPUs. The decision is
+    # made from the filesystem, which is identical on every rank in a Kaggle
+    # session, so no collective is needed to agree.
     step = 0
+    start_epoch = 0
+    if is_main():
+        path = maybe_resume()
+    else:
+        path = None
+    if dist.is_initialized():
+        # Broadcast rank 0's decision so a rank that missed the file still agrees.
+        flag = torch.tensor(
+            [1 if path else 0], dtype=torch.int32, device=device
+        )
+        dist.broadcast(flag, src=0)
+        if not path and int(flag.item()) == 1:
+            # Rank 0 found a checkpoint; every rank must wait for it to land.
+            dist.barrier()
+            path = find_latest_checkpoint(CHECKPOINT_DIR)
+
+    if path:
+        start_step = load_checkpoint(path, ddp_model, optimizer)
+        step = start_step
+        start_epoch = start_step // max(1, steps_per_epoch)
+        _LAST_SAVED_STEP[0] = start_step
+        log(f"[resume] continuing from step {start_step} (epoch {start_epoch})")
+    else:
+        log("[resume] no prior checkpoint — starting from step 0")
+
+    last_loss = None
     try:
-        for epoch in range(10_000 if not MAX_STEPS else 1):
+        # Resume lands mid-epoch when steps_per_epoch does not divide the saved
+        # step. `skip_micro` counts the batches already consumed inside the
+        # current epoch so they are not trained on a second time; the sampler is
+        # seeded by epoch, so restarting at the same epoch index reproduces the
+        # same batch order and the skip lands on exactly the right batch.
+        skip_micro = step * GRAD_ACCUM % max(1, steps_per_epoch * GRAD_ACCUM)
+
+        for epoch in range(start_epoch, 10_000 if not MAX_STEPS else start_epoch + 1):
             sampler.set_epoch(epoch)
             ddp_model.train()
             running = t0 = 0.0
             optimizer.zero_grad(set_to_none=True)
 
+            start_it = skip_micro if epoch == start_epoch else 0
+            if start_it:
+                log(f"[resume] epoch {epoch}: skipping {start_it} consumed batches")
+
             for it, batch in enumerate(train_loader):
+                if it < start_it:
+                    continue
                 x = batch["x"].to(device, non_blocking=True)
                 y = batch["y"].to(device, non_blocking=True)
 
@@ -702,7 +797,7 @@ def main() -> None:
 
                 if step % SAVE_EVERY == 0:
                     checkpoint(ddp_model, optimizer, step, config,
-                               loss=last_loss, uploader=uploader)
+                               loss=last_loss, uploader=uploader, device=device)
 
                 if MAX_STEPS and step >= MAX_STEPS:
                     break
@@ -710,18 +805,18 @@ def main() -> None:
                 break
 
         checkpoint(ddp_model, optimizer, step, config,
-                   loss=last_loss, uploader=uploader)
+                   loss=last_loss, uploader=uploader, device=device)
         log(f"[done] {step:,} steps complete")
 
     except KeyboardInterrupt:
         log("[interrupt] checkpointing before exit")
         checkpoint(ddp_model, optimizer, step, config,
-                   loss=last_loss, uploader=uploader)
+                   loss=last_loss, uploader=uploader, device=device)
         raise
     except Exception as exc:
         log(f"[error] {type(exc).__name__}: {exc}")
         checkpoint(ddp_model, optimizer, step, config,
-                   loss=last_loss, uploader=uploader)
+                   loss=last_loss, uploader=uploader, device=device)
         raise
     finally:
         # Drain the upload queue BEFORE tearing anything down. A daemon thread is
