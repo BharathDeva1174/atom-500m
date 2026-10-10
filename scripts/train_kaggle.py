@@ -64,6 +64,12 @@ ATOM_CONFIG = {
     "ff_expansion": 3.53,
 }
 
+# Runtime-only switches, set on the model rather than stored in the JSON config.
+# `verify_config` deliberately ignores these: they are training-run decisions
+# (is VRAM tight?), not properties of the architecture, and requiring them in
+# the config file would make a config change for every memory experiment.
+RUNTIME_FLAGS = {"grad_checkpointing"}
+
 HF_REPO = os.environ.get("HF_REPO_ID", "siddhu1174/atom-500m")
 SHARD_DIR = Path(os.environ.get("ATOM_SHARD_DIR", "./data/shards"))
 CONFIG_PATH = os.environ.get("ATOM_CONFIG", "configs/atom_500m.json")
@@ -86,6 +92,7 @@ EVAL_BATCHES = int(os.environ.get("ATOM_EVAL_BATCHES", 20))
 SAVE_EVERY = int(os.environ.get("ATOM_SAVE_EVERY", 500))
 MAX_STEPS = int(os.environ.get("ATOM_MAX_STEPS", 0))        # 0 = one epoch
 DOWNLOAD = os.environ.get("ATOM_DOWNLOAD", "1") == "1"
+GRAD_CHECKPOINTING = os.environ.get("ATOM_GRAD_CHECKPOINT", "0") == "1"
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
@@ -109,6 +116,8 @@ def verify_config(skip: bool = False) -> dict:
     if skip:
         return cfg
     for k, want in ATOM_CONFIG.items():
+        if k in RUNTIME_FLAGS:
+            continue  # training-run switch, not an architecture property
         got = cfg.get(k)
         if got != want:
             raise ValueError(
@@ -231,7 +240,10 @@ def setup() -> tuple:
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         device = torch.device("cpu")
-        if dist.is_available() and world_size > 1:
+        # DDP requires a process group even for a single process, so this is
+        # initialized unconditionally. Skipping it at world_size==1 makes every
+        # single-process run fail at the DDP constructor instead of training.
+        if dist.is_available():
             init = os.environ.get("ATOM_INIT_METHOD")
             if init:
                 dist.init_process_group(
@@ -239,7 +251,9 @@ def setup() -> tuple:
                     world_size=world_size,
                 )
             else:
-                dist.init_process_group(backend="gloo")
+                dist.init_process_group(
+                    backend="gloo", rank=rank, world_size=world_size,
+                )
 
         def amp():
             return contextlib.nullcontext()
@@ -402,6 +416,13 @@ def main() -> None:
     log(f"[model] {n_params:,} parameters ({n_params / 1e6:.2f}M)")
     if not (495e6 <= n_params <= 500e6):
         log(f"[model] WARNING: outside the 495M-500M target band")
+
+    # Gradient checkpointing trades ~30% step time for a large cut in
+    # activation VRAM. Only meaningful in training mode; the model bypasses it
+    # in eval, so eval cost is unchanged.
+    model.grad_checkpointing = GRAD_CHECKPOINTING
+    if GRAD_CHECKPOINTING:
+        log("[model] gradient checkpointing ON (activations recomputed in backward)")
 
     ddp_model = DDP(
         model,

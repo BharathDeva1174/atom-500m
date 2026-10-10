@@ -40,6 +40,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 DEFAULT_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -171,13 +172,20 @@ class Atom500M(nn.Module):
         self.n_head = config["n_head"]
 
         self.wte = nn.Embedding(config["vocab_size"], config["d_model"])
-        # Learned absolute positions, GPT-2 style. Causal attention constrains
+        # Learned absolute positions, GPT-2 style. Causal attention restricts
         # *which* tokens a position may attend to, but without this the model
         # still cannot tell where in the sequence any token sits.
         self.wpe = nn.Embedding(config["block_size"], config["d_model"])
         self.blocks = nn.ModuleList([Block(config) for _ in range(config["n_layer"])])
         self.ln_f = nn.LayerNorm(config["d_model"])
         self.lm_head = nn.Linear(config["d_model"], config["vocab_size"], bias=False)
+
+        # Gradient checkpointing. When on, each block's inner activations are
+        # discarded after the forward pass and recomputed during backward,
+        # trading ~30% extra compute for a large cut in activation VRAM.
+        # Defaults OFF: this is a memory/speed trade the caller should choose,
+        # and enabling it silently would make the default path ~30% slower.
+        self.grad_checkpointing = bool(config.get("grad_checkpointing", False))
 
         # Weight tying: one 51.5M-parameter embedding matrix serves as both input
         # embedding and output classifier. Applied after init so that the tied
@@ -296,7 +304,16 @@ class Atom500M(nn.Module):
         x = self.wte(idx) + self.wpe(pos)  # (B, T, C)
 
         for block in self.blocks:
-            x = block(x)
+            if self.grad_checkpointing and self.training:
+                # use_reentrant=False is required, not stylistic. The reentrant
+                # implementation does not support a nested/autograd structure
+                # where inputs are passed positionally, and silently produces
+                # no gradients for some parameter patterns. The non-reentrant
+                # version also lets us checkpoint with no grad-requiring inputs
+                # and handles autocast correctly under mixed precision.
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         x = self.ln_f(x)
 
         logits = self.lm_head(x)  # (B, T, V) — tied to wte.weight

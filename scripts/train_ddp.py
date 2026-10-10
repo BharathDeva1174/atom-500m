@@ -74,6 +74,7 @@ EVAL_EVERY = int(os.environ.get("ATOM_EVAL_EVERY", 100))
 LOG_EVERY = int(os.environ.get("ATOM_LOG_EVERY", 20))
 MAX_EPOCHS = int(os.environ.get("ATOM_MAX_EPOCHS", 1))
 COMPILE = os.environ.get("ATOM_COMPILE", "0") == "1"
+GRAD_CHECKPOINTING = os.environ.get("ATOM_GRAD_CHECKPOINT", "0") == "1"
 
 HF_FALLBACK_REPO = "siddhu1174/atom-500m"
 
@@ -283,6 +284,12 @@ def main():
     model = Atom500M(config).to(device)
     log(f"[model] {model.num_parameters():,} parameters "
         f"({model.num_parameters() / 1e6:.1f}M)")
+
+    # Recompute block activations in backward instead of storing them. Off by
+    # default; enable when VRAM is the binding constraint.
+    model.grad_checkpointing = GRAD_CHECKPOINTING
+    if GRAD_CHECKPOINTING:
+        log("[model] gradient checkpointing ON (activations recomputed in backward)")
 
     if COMPILE:
         # ~2x step time after a ~1 min warmup. Off by default: on a 12h Kaggle
