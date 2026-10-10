@@ -96,10 +96,12 @@ GRAD_CLIP = 1.0
 LOG_EVERY = int(os.environ.get("ATOM_LOG_EVERY", 20))
 EVAL_EVERY = int(os.environ.get("ATOM_EVAL_EVERY", 100))
 EVAL_BATCHES = int(os.environ.get("ATOM_EVAL_BATCHES", 20))
-# Every 100 steps. Measured, not assumed: a 497M checkpoint is ~5.6 GiB (fp32
-# weights 1.85 + AdamW exp_avg 1.85 + exp_avg_sq 1.85, i.e. 12 bytes/param), so
-# this is a real data-loss/speed trade. See KEEP_LOCAL_COUNT for the disk math.
-SAVE_EVERY = int(os.environ.get("ATOM_SAVE_EVERY", 100))
+# Every 500 steps. A 497M checkpoint is ~5.6 GiB (fp32 weights 1.85 + AdamW
+# exp_avg 1.85 + exp_avg_sq 1.85, i.e. 12 bytes/param), so this is a real
+# data-loss/speed trade, not a cosmetic interval. At 100 the upload rate is 5x
+# higher and saturates a residential connection; 500 costs at most 500 steps of
+# progress on a hard kill. See KEEP_LOCAL_COUNT for the disk math.
+SAVE_EVERY = int(os.environ.get("ATOM_SAVE_EVERY", 500))
 MAX_STEPS = int(os.environ.get("ATOM_MAX_STEPS", 0))        # 0 = one epoch
 DOWNLOAD = os.environ.get("ATOM_DOWNLOAD", "1") == "1"
 GRAD_CHECKPOINTING = os.environ.get("ATOM_GRAD_CHECKPOINT", "0") == "1"

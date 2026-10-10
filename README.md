@@ -193,12 +193,12 @@ model.
 
 ### Checkpoints
 
-Saved and evaluated every 100 steps, then uploaded to the Hub **from a background
-thread** so a slow network never stalls a training step.
+Evaluated every 100 steps and checkpointed every 500, then uploaded to the Hub
+**from a background thread** so a slow network never stalls a training step.
 
 ```
-[ckpt] step 100 saved (5572 MB) in 22.1s    <- on the training thread
-[upload] step_100.pt -> checkpoints/step_100.pt (84.3s)   <- on the uploader
+[ckpt] step 500 saved (5572 MB) in 22.1s    <- on the training thread
+[upload] step_500.pt -> checkpoints/step_500.pt (84.3s)   <- on the uploader
 ```
 
 **A checkpoint is ~5.6 GiB, not ~2 GB.** Measured at 12 bytes/parameter: fp32
@@ -208,8 +208,8 @@ each. At `SAVE_EVERY=100` on Kaggle's ~20 GB disk, the last **2** checkpoints
 
 | Variable | Default | Notes |
 |---|---|---|
-| `ATOM_SAVE_EVERY` | 100 | Steps between checkpoints. |
-| `ATOM_EVAL_EVERY` | 100 | Steps between evaluations. |
+| `ATOM_SAVE_EVERY` | 500 | Steps between checkpoints. At 100 the upload rate is 5× higher and saturates a residential connection; 500 costs at most 500 steps of progress on a hard kill. |
+| `ATOM_EVAL_EVERY` | 100 | Steps between evaluations. Cheap — no disk cost. |
 | `ATOM_UPLOAD_QUEUE` | 3 | Max unsent checkpoints before the oldest is dropped. |
 | `ATOM_UPLOAD_JOIN_TIMEOUT` | 300 | Seconds to wait for the queue at exit. |
 | `ATOM_KEEP_LOCAL_COUNT` | 2 | Uploaded checkpoints retained on disk. |
