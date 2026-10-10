@@ -1,0 +1,8 @@
+{
+  "vocab_size": 50257,
+  "d_model": 1024,
+  "n_layer": 29,
+  "n_head": 16,
+  "block_size": 2048,
+  "ff_expansion": 3.53
+}

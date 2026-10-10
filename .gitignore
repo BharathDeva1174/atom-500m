@@ -1,0 +1,9 @@
+checkpoints/
+*.pt
+*.bin
+.venv/
+__pycache__/
+.env
+
+data/
+configs/smoke.json
