@@ -193,13 +193,32 @@ model.
 
 ### Checkpoints
 
-Saved every 500 steps, then uploaded to the Hub **from a background thread** so
-a slow network never stalls a training step.
+Saved and evaluated every 100 steps, then uploaded to the Hub **from a background
+thread** so a slow network never stalls a training step.
 
 ```
-[ckpt] step 500 saved (2000 MB) in 8.3s     <- on the training thread
-[upload] step_500.pt -> checkpoints/step_500.pt (42.1s)   <- on the uploader
+[ckpt] step 100 saved (5572 MB) in 22.1s    <- on the training thread
+[upload] step_100.pt -> checkpoints/step_100.pt (84.3s)   <- on the uploader
 ```
+
+**A checkpoint is ~5.6 GiB, not ~2 GB.** Measured at 12 bytes/parameter: fp32
+weights 1.85 GiB plus *two* AdamW states (`exp_avg` and `exp_avg_sq`) at 1.85 GiB
+each. At `SAVE_EVERY=100` on Kaggle's ~20 GB disk, the last **2** checkpoints
+(11.1 GiB) plus the 444 MB corpus fits — but only while uploads keep pace.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ATOM_SAVE_EVERY` | 100 | Steps between checkpoints. |
+| `ATOM_EVAL_EVERY` | 100 | Steps between evaluations. |
+| `ATOM_UPLOAD_QUEUE` | 3 | Max unsent checkpoints before the oldest is dropped. |
+| `ATOM_UPLOAD_JOIN_TIMEOUT` | 300 | Seconds to wait for the queue at exit. |
+| `ATOM_KEEP_LOCAL_COUNT` | 2 | Uploaded checkpoints retained on disk. |
+| `ATOM_KEEP_LOCAL` | 0 | Set 1 to retain *every* checkpoint (disk permitting). |
+
+**Retention never prunes an unconfirmed checkpoint.** A file still uploading is
+protected, even if it is the oldest — deleting the only local copy of a step that
+hasn't reached the Hub would leave a failed upload with no recovery. Retention
+applies only to checkpoints confirmed on the Hub.
 
 **Only the save is synchronous.** `torch.save` reads tensors the training loop
 is concurrently mutating — the optimizer state especially — so serializing it
@@ -208,23 +227,36 @@ but whose optimizer state is half from step N and half from step N+1. The save
 stays on the main thread to make the snapshot consistent; only the network wait,
 which is the slow and variable part, moves off.
 
-**The queue is bounded** (default 3). If uploads fall behind, the *oldest*
-pending upload is dropped and its file deleted — recent checkpoints are the
-valuable ones, and an unbounded queue would fill Kaggle's disk and kill the run.
-
-**Shutdown drains the queue** with a bounded timeout. A daemon thread is killed
-at interpreter exit, so without this a checkpoint submitted moments before
-completion would never reach the Hub, and the run would report success with its
-final weights missing. A *hung* upload can't block exit either.
+**Shutdown drains the queue** with a bounded timeout, so a checkpoint submitted
+moments before completion still lands and a hung upload cannot block exit.
 
 A failed upload is logged and the thread keeps going — the run continues and
 keeps checkpointing.
 
-| Variable | Default | Notes |
-|---|---|---|
-| `ATOM_UPLOAD_QUEUE` | 3 | Max unsent checkpoints before the oldest is dropped. |
-| `ATOM_UPLOAD_JOIN_TIMEOUT` | 300 | Seconds to wait for the queue at exit. |
-| `ATOM_KEEP_LOCAL` | 0 | Set 1 to keep checkpoints on disk after upload. |
+### Resuming
+
+A previous run is picked up automatically: `ATOM_RESUME`, else the newest local
+checkpoint, else the Hub. Every rank must start from the same step (they share a
+sampler), so rank 0's decision is broadcast. Consumed micro-batches in the
+current epoch are skipped, so resume does not re-train the prefix.
+
+Checkpoints are ranked by **parsed step number**, not filename — lexicographic
+sorting picks `step_999.pt` over `step_1000.pt`, silently resuming from stale
+weights.
+
+### DDP device correctness
+
+Every tensor passed to a collective is created on the training device. NCCL
+cannot reduce CPU tensors, so a CPU reduction tensor crashes on GPU while working
+fine under gloo — which is why this only ever surfaced in a CUDA run. Verify with:
+
+```bash
+python scripts/validate_ddp_device.py
+```
+
+It checks statically (AST scan of every collective) *and* at runtime (a spy over
+`dist.all_reduce` during a real group), so a device-less collective added later is
+caught too.
 
 Without `HF_TOKEN`, checkpoints stay local and nothing is uploaded.
 

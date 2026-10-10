@@ -323,15 +323,26 @@ def load_checkpoint(
     return int(ckpt.get("step", 0))
 
 
-def cleanup_stale_checkpoints(checkpoint_dir: str = CHECKPOINT_DIR, keep: int = 1) -> None:
+def cleanup_stale_checkpoints(
+    checkpoint_dir: str = CHECKPOINT_DIR,
+    keep: int = 1,
+    protect: Optional[set] = None,
+) -> int:
     """Remove all but the `keep` most recent local checkpoints.
 
-    Insurance against a crash mid-upload leaving 2 GB orphans behind. Runs on
-    rank 0 only.
+    `protect` names files that must never be deleted regardless of age --
+    specifically, checkpoints whose upload has not yet been confirmed. Pruning
+    by recency alone would delete a fresh checkpoint that is still uploading,
+    destroying the only local copy and leaving the run with no resume point if
+    the upload then fails. Retention is only safe once a copy exists elsewhere.
+
+    Returns the number of files removed.
     """
     if not os.path.isdir(checkpoint_dir):
-        return
-    steps = []
+        return 0
+
+    protect = {os.path.abspath(p) for p in (protect or ())}
+    steps: list = []
     for name in os.listdir(checkpoint_dir):
         if name.startswith("step_") and name.endswith(".pt"):
             try:
@@ -339,12 +350,26 @@ def cleanup_stale_checkpoints(checkpoint_dir: str = CHECKPOINT_DIR, keep: int = 
             except ValueError:
                 continue
     steps.sort()
-    for _, path in steps[:-keep] if keep > 0 else steps:
+
+    # Everything protected counts toward the retention budget, so N protected
+    # files mean the oldest unprotected ones go first.
+    n_protected = sum(1 for _, p in steps if os.path.abspath(p) in protect)
+    n_keep = max(0, keep - n_protected)
+    doomed = [p for _, p in steps if os.path.abspath(p) not in protect]
+    victims = doomed[:max(0, len(doomed) - n_keep)] if n_keep else doomed
+
+    removed = 0
+    for path in victims:
         try:
             os.remove(path)
-            print(f"[sync] removed stale checkpoint {path}")
+            removed += 1
         except Exception as exc:
             print(f"[sync] WARNING: could not remove {path}: {exc}")
+    if removed:
+        freed = sum(1 for _ in victims)
+        print(f"[sync] pruned {freed} stale checkpoint(s), "
+              f"{n_protected} in-flight protected")
+    return removed
 
 
 if __name__ == "__main__":

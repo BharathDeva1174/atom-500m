@@ -94,9 +94,12 @@ WARMUP_STEPS = int(os.environ.get("ATOM_WARMUP", 200))
 WEIGHT_DECAY = float(os.environ.get("ATOM_WD", 0.1))
 GRAD_CLIP = 1.0
 LOG_EVERY = int(os.environ.get("ATOM_LOG_EVERY", 20))
-EVAL_EVERY = int(os.environ.get("ATOM_EVAL_EVERY", 250))
+EVAL_EVERY = int(os.environ.get("ATOM_EVAL_EVERY", 100))
 EVAL_BATCHES = int(os.environ.get("ATOM_EVAL_BATCHES", 20))
-SAVE_EVERY = int(os.environ.get("ATOM_SAVE_EVERY", 500))
+# Every 100 steps. Measured, not assumed: a 497M checkpoint is ~5.6 GiB (fp32
+# weights 1.85 + AdamW exp_avg 1.85 + exp_avg_sq 1.85, i.e. 12 bytes/param), so
+# this is a real data-loss/speed trade. See KEEP_LOCAL_COUNT for the disk math.
+SAVE_EVERY = int(os.environ.get("ATOM_SAVE_EVERY", 100))
 MAX_STEPS = int(os.environ.get("ATOM_MAX_STEPS", 0))        # 0 = one epoch
 DOWNLOAD = os.environ.get("ATOM_DOWNLOAD", "1") == "1"
 GRAD_CHECKPOINTING = os.environ.get("ATOM_GRAD_CHECKPOINT", "0") == "1"
@@ -106,6 +109,12 @@ GRAD_CHECKPOINTING = os.environ.get("ATOM_GRAD_CHECKPOINT", "0") == "1"
 UPLOAD_QUEUE = int(os.environ.get("ATOM_UPLOAD_QUEUE", 3))
 UPLOAD_JOIN_TIMEOUT = float(os.environ.get("ATOM_UPLOAD_JOIN_TIMEOUT", 300.0))
 DELETE_AFTER_UPLOAD = os.environ.get("ATOM_KEEP_LOCAL", "0") != "1"
+# How many uploaded checkpoints to retain locally. Measured at ~5.6 GiB each,
+# so 2 is ~11.2 GiB -- comfortable on Kaggle's ~20 GB alongside a 0.43 GiB
+# corpus, but only while uploads keep pace. Retention is applied *after* a
+# successful upload, so a checkpoint whose upload failed is never pruned: that
+# is the fallback this retention exists to provide.
+KEEP_LOCAL_COUNT = int(os.environ.get("ATOM_KEEP_LOCAL_COUNT", 2))
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
@@ -435,6 +444,10 @@ class AsyncUploader:
         self.uploaded = 0
         self.failed = 0
         self.dropped = 0
+        # Paths confirmed to exist on the Hub. Read by the retention step so a
+        # checkpoint still in flight is never pruned -- deleting the only local
+        # copy of an unuploaded checkpoint is how a run ends up unresumable.
+        self._confirmed: set = set()
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
@@ -488,6 +501,27 @@ class AsyncUploader:
     def pending(self) -> int:
         return self._queue.qsize()
 
+    def confirmed(self) -> set:
+        """Absolute paths known to be on the Hub."""
+        with self._lock:
+            return set(self._confirmed)
+
+    def in_flight(self, checkpoint_dir: str) -> set:
+        """Local checkpoints that exist but are not yet confirmed on the Hub.
+
+        These must survive retention: they are the only copy of that step.
+        """
+        confirmed = self.confirmed()
+        out = set()
+        if not os.path.isdir(checkpoint_dir):
+            return out
+        for name in os.listdir(checkpoint_dir):
+            if name.startswith("step_") and name.endswith(".pt"):
+                p = os.path.abspath(os.path.join(checkpoint_dir, name))
+                if p not in confirmed:
+                    out.add(p)
+        return out
+
     # -- consumer -----------------------------------------------------------
     def _worker(self) -> None:
         try:
@@ -520,6 +554,7 @@ class AsyncUploader:
                 )
                 with self._lock:
                     self.uploaded += 1
+                    self._confirmed.add(os.path.abspath(path))
                 print(f"[upload] {name} -> {remote} ({time.time() - t0:.1f}s)")
                 if self.delete_after:
                     _quiet_remove(path)
@@ -617,6 +652,13 @@ def checkpoint(model, optimizer, step, config, loss=None, uploader=None,
                 f"in {time.time() - t0:.1f}s")
             if uploader is not None:
                 uploader.submit(path)
+                # Retain the last N *confirmed* checkpoints. In-flight files are
+                # protected: at 5.6 GiB each, pruning one that has not reached
+                # the Hub yet would leave the run with no resume point.
+                cleanup_stale_checkpoints(
+                    CHECKPOINT_DIR, keep=KEEP_LOCAL_COUNT,
+                    protect=uploader.in_flight(CHECKPOINT_DIR),
+                )
             elif not HF_TOKEN:
                 # No uploader and no token: the local copy is the only one, so
                 # it must not be deleted.
