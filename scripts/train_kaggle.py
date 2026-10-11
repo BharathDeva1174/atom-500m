@@ -831,10 +831,17 @@ def main() -> None:
             [1 if path else 0], dtype=torch.int32, device=device
         )
         dist.broadcast(flag, src=0)
-        if not path and int(flag.item()) == 1:
-            # Rank 0 found a checkpoint; every rank must wait for it to land.
+        if int(flag.item()) == 1:
+            # Rank 0 has located -- and finished downloading -- the checkpoint.
+            # EVERY rank waits here, rank 0 included: a barrier only releases
+            # when all ranks enter it, and a non-main rank waiting on a barrier
+            # that rank 0 never joins deadlocks the job silently at exactly the
+            # moment the resume was supposed to make safe. Only a rank without
+            # a path needs to re-resolve it locally; on a shared filesystem the
+            # file rank 0 found is already visible to everyone.
             dist.barrier()
-            path = find_latest_checkpoint(CHECKPOINT_DIR)
+            if not path:
+                path = find_latest_checkpoint(CHECKPOINT_DIR)
 
     if path:
         try:
