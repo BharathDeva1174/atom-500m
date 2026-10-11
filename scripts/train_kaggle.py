@@ -31,6 +31,7 @@ import json
 import math
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -225,32 +226,36 @@ def ensure_shards() -> None:
         )
 
     log(f"[data] downloading data/ from {HF_REPO} ...")
-    snapshot_download(
+    snapshot_path = snapshot_download(
         repo_id=HF_REPO,
         repo_type="dataset" if os.environ.get("HF_REPO_TYPE") == "dataset" else "model",
         allow_patterns=["data/*.bin"],
         token=HF_TOKEN or None,
-        local_dir=".",
     )
 
-    # Reconcile the Hub layout (data/shard_NNNN.bin) with the trainer's layout
-    # (data/shards/). Unconditional -- a crashed earlier run can leave shards
-    # SPLIT between the two directories, and a non-empty data/shards must not
-    # skip reconciliation of the remaining strays. Both ranks run this
-    # concurrently: every rename tolerates the sibling having moved the file
-    # first, and the count check waits out a mid-move sibling rather than
-    # failing on a half-reconciled directory.
-    for p in sorted(SHARD_DIR.parent.glob("*.bin")):
-        try:
-            p.rename(SHARD_DIR / p.name)
-        except (FileNotFoundError, OSError):
-            pass
-    for _ in range(30):
-        if any(SHARD_DIR.glob("*.bin")):
-            break
-        time.sleep(2)
+    # Copy out of the Hub cache instead of moving. local_dir="." cannot be
+    # reconciled after the fact: moving a downloaded file away leaves the
+    # local_dir metadata claiming it exists, so every later download is a
+    # cache hit that never re-materializes the file ("Fetching 5 files 100%"
+    # followed by an empty data/). The cache stays intact, so re-runs are
+    # instant and both ranks can copy concurrently (copy2 of identical bytes
+    # is race-safe; the exists() check usually avoids the double write).
+    src_dir = Path(snapshot_path) / "data"
+    n = 0
+    if src_dir.is_dir():
+        for p in sorted(src_dir.glob("*.bin")):
+            target = SHARD_DIR / p.name
+            if not target.exists():
+                shutil.copy2(p, target)
+            n += 1
+    else:
+        # Snapshot layouts vary; fall back to walking the whole snapshot.
+        for p in sorted(Path(snapshot_path).rglob("*.bin")):
+            target = SHARD_DIR / p.name
+            if not target.exists():
+                shutil.copy2(p, target)
+            n += 1
 
-    n = len(sorted(SHARD_DIR.glob("*.bin")))
     if not n:
         raise SystemExit(
             f"download completed but no .bin files landed in {SHARD_DIR}. "
