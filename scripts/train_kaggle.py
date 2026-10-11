@@ -241,6 +241,7 @@ def ensure_shards() -> None:
     # instant and both ranks can copy concurrently (copy2 of identical bytes
     # is race-safe; the exists() check usually avoids the double write).
     src_dir = Path(snapshot_path) / "data"
+    SHARD_DIR.mkdir(parents=True, exist_ok=True)
     n = 0
     if src_dir.is_dir():
         for p in sorted(src_dir.glob("*.bin")):
