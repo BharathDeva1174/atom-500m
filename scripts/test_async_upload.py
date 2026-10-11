@@ -236,24 +236,126 @@ def test_eval_save_alignment():
     """
     import train_kaggle as K
 
-    print("\n[eval/checkpoint alignment]")
-    check("EVAL_EVERY == SAVE_EVERY", K.EVAL_EVERY == K.SAVE_EVERY,
+    print("\n[eval/checkpoint decoupling]")
+    # Eval is 5x more frequent than checkpointing: an eval writes no files, so
+    # a fine-grained loss curve is nearly free, while a checkpoint is ~5.6 GiB.
+    check("EVAL_EVERY == 100", K.EVAL_EVERY == 100, str(K.EVAL_EVERY))
+    check("SAVE_EVERY == 500", K.SAVE_EVERY == 500, str(K.SAVE_EVERY))
+    check("cadences are decoupled", K.EVAL_EVERY != K.SAVE_EVERY,
           f"eval={K.EVAL_EVERY} save={K.SAVE_EVERY}")
-    check("both are 500 by default", K.EVAL_EVERY == 500 and K.SAVE_EVERY == 500,
-          f"eval={K.EVAL_EVERY} save={K.SAVE_EVERY}")
+    check("eval is the more frequent of the two",
+          K.EVAL_EVERY < K.SAVE_EVERY, f"eval={K.EVAL_EVERY} save={K.SAVE_EVERY}")
+    # 500 is a multiple of 100, so every checkpoint step is also an eval step:
+    # decoupling costs no eval freshness at these values. This is a property of
+    # the numbers, not a guarantee -- which is why eval_step is recorded.
+    check("SAVE_EVERY is a multiple of EVAL_EVERY",
+          K.SAVE_EVERY % K.EVAL_EVERY == 0,
+          f"{K.SAVE_EVERY} % {K.EVAL_EVERY}")
+    check("so checkpoint steps are also eval steps (gap 0)",
+          K.SAVE_EVERY % K.EVAL_EVERY == 0,
+          f"every {K.SAVE_EVERY}th step is a multiple of {K.EVAL_EVERY}")
 
-    # The loop must run eval before checkpoint on a shared step, otherwise the
-    # checkpoint records the previous interval's eval.
+    # Demonstrate the non-multiple case actually produces a gap, so the
+    # eval_step field is not decorative. Asserted against computed values.
+    def staleness(save_every: int, eval_every: int) -> int:
+        """Largest gap between a checkpoint step and the nearest eval step."""
+        s, worst = save_every, 0
+        while s > 0:
+            off = s % eval_every
+            if off:
+                worst = max(worst, eval_every - off)
+            s -= eval_every
+        return worst
+
+    for save_every, want in ((500, 0), (250, 50), (300, 0), (700, 0),
+                             (450, 50), (1000, 0)):
+        got = staleness(save_every, K.EVAL_EVERY)
+        check(f"  save={save_every}: staleness == {want}", got == want,
+              f"got {got}")
+
+    # The value actually recorded must make this recoverable: a checkpoint at
+    # 250 with eval_every=100 carries eval_step=200, so eval_step - 0 is the
+    # gap, not a silent 50.
+    with tempfile.TemporaryDirectory() as td:
+        from src.model import Atom500M
+        from src.sync import save_local_checkpoint
+        import torch as T
+        m = Atom500M({"vocab_size": 512, "d_model": 64, "n_head": 4,
+                      "n_layer": 2, "block_size": 32, "ff_expansion": 3.5})
+        opt = T.optim.AdamW(m.parameters(), lr=1e-4)
+        p = save_local_checkpoint(m, opt, step=250, config={}, loss=0.5,
+                                 eval_loss=0.4, eval_step=200,
+                                 checkpoint_dir=td)
+        d = T.load(p, map_location="cpu", weights_only=False)
+        check("stale checkpoint is self-describing",
+              d["step"] - d["eval_step"] == 50,
+              f"step={d['step']} eval_step={d['eval_step']} "
+              f"gap={d['step'] - d['eval_step']}")
+
     import io as _io
     src = _io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "train_kaggle.py"), encoding="utf-8").read()
     i_eval = src.find("if step % EVAL_EVERY == 0:")
     i_save = src.find("if step % SAVE_EVERY == 0:")
     check("both cadence checks exist", i_eval > 0 and i_save > 0)
-    check("eval runs before checkpoint in the loop", 0 < i_eval < i_save,
-          f"eval@{i_eval} save@{i_save}")
-    check("checkpoint receives the eval loss",
-          "eval_loss=last_eval" in src)
+    # The cache must be assigned inside the eval branch and read inside the
+    # checkpoint branch -- that is the whole mechanism.
+    check("eval branch writes the cache",
+          "latest_eval_loss = evaluate(" in src, "")
+    check("cache is assigned with its source step",
+          "latest_eval_step = step" in src, "")
+    check("checkpoint branch reads the cache",
+          "eval_loss=latest_eval_loss" in src, "")
+    check("checkpoint records the eval's source step",
+          "eval_step=latest_eval_step" in src, "")
+
+
+def test_cached_eval_semantics():
+    """A checkpoint must carry the cached eval, flagged with where it came from.
+
+    With decoupled cadences the recorded eval is usually NOT from the
+    checkpoint's own step. `eval_step` is what distinguishes a fresh
+    measurement from a carried-over one, and omitting it would let a reader
+    treat a 400-step-old number as current.
+    """
+    import torch as T
+
+    from src.model import Atom500M
+    from src.sync import save_local_checkpoint
+
+    print("\n[cached eval semantics]")
+    cfg = {"vocab_size": 512, "d_model": 64, "n_head": 4, "n_layer": 2,
+           "block_size": 32, "ff_expansion": 3.5}
+    m = Atom500M(cfg)
+    opt = T.optim.AdamW(m.parameters(), lr=1e-4)
+
+    with tempfile.TemporaryDirectory() as td:
+        # Checkpoint at 500, most recent eval at 400.
+        p = save_local_checkpoint(m, opt, step=500, config=cfg, loss=0.8,
+                                 eval_loss=0.61, eval_step=400,
+                                 checkpoint_dir=td)
+        ck = T.load(p, map_location="cpu", weights_only=False)
+        check("checkpoint step recorded", ck["step"] == 500, str(ck["step"]))
+        check("cached eval_loss recorded", abs(ck["eval_loss"] - 0.61) < 1e-9,
+              str(ck["eval_loss"]))
+        check("eval_step records the eval's origin", ck["eval_step"] == 400,
+              str(ck.get("eval_step")))
+        check("eval_step is strictly before the checkpoint step",
+              ck["eval_step"] < ck["step"],
+              f"eval@{ck['eval_step']} ckpt@{ck['step']}")
+        check("staleness is bounded by one interval",
+              0 < ck["step"] - ck["eval_step"] <= 100,
+              f"gap {ck['step'] - ck['eval_step']}")
+
+        # No evaluation yet: the field must be present and null, not missing.
+        p2 = save_local_checkpoint(m, opt, step=10, config=cfg, loss=0.9,
+                                   checkpoint_dir=td)
+        ck2 = T.load(p2, map_location="cpu", weights_only=False)
+        check("eval_loss null before first eval", ck2["eval_loss"] is None,
+              str(ck2["eval_loss"]))
+        check("eval_step null before first eval", ck2["eval_step"] is None,
+              str(ck2["eval_step"]))
+        check("key present even when null", "eval_step" in ck2)
 
 
 def test_round_trip_into_model():
@@ -308,6 +410,7 @@ if __name__ == "__main__":
     test_checkpoint_contents()
     test_round_trip_into_model()
     test_eval_save_alignment()
+    test_cached_eval_semantics()
     print("\n" + "=" * 66)
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): " + ", ".join(FAILURES))

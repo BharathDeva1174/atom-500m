@@ -75,13 +75,16 @@ def build_checkpoint(
     config: Optional[dict] = None,
     loss: Optional[float] = None,
     eval_loss: Optional[float] = None,
+    eval_step: Optional[int] = None,
 ) -> dict:
     """Assemble the checkpoint dict. Exposed separately so tests can inspect
     the contents without touching the filesystem.
 
-    `loss` is the most recent training loss and `eval_loss` the held-out loss
-    measured at this step, so a resumed run can be sanity-checked against the
-    run that produced it.
+    `loss` is the most recent training loss, `eval_loss` the most recent
+    held-out loss, and `eval_step` the step that evaluation was measured at.
+    The last two are cached independently of the checkpoint cadence, so
+    `eval_step` is usually *less than* `step` -- recorded explicitly so a
+    resumed run can tell a fresh evaluation from a carried-over one.
     """
     module = _unwrap(model)
     return {
@@ -93,6 +96,7 @@ def build_checkpoint(
         "config": config,
         "loss": loss,
         "eval_loss": eval_loss,
+        "eval_step": eval_step,
         "saved_at": time.time(),
     }
 
@@ -104,6 +108,7 @@ def save_local_checkpoint(
     config: Optional[dict] = None,
     loss: Optional[float] = None,
     eval_loss: Optional[float] = None,
+    eval_step: Optional[int] = None,
     checkpoint_dir: str = CHECKPOINT_DIR,
 ) -> Optional[str]:
     """Write a checkpoint to disk and return its path, or None on failure.
@@ -120,7 +125,8 @@ def save_local_checkpoint(
     path = os.path.join(checkpoint_dir, f"step_{step}.pt")
     try:
         torch.save(
-            build_checkpoint(model, optimizer, step, config, loss, eval_loss),
+            build_checkpoint(model, optimizer, step, config, loss, eval_loss,
+                             eval_step),
             path,
         )
     except Exception as exc:

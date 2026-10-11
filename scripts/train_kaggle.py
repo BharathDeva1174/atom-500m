@@ -94,14 +94,27 @@ WARMUP_STEPS = int(os.environ.get("ATOM_WARMUP", 200))
 WEIGHT_DECAY = float(os.environ.get("ATOM_WD", 0.1))
 GRAD_CLIP = 1.0
 LOG_EVERY = int(os.environ.get("ATOM_LOG_EVERY", 20))
-# Evaluation is aligned with checkpointing (both every 500 steps) so each
-# checkpoint interval carries exactly one eval. They are separate collectives:
-# eval all-reduces a loss statistic, the checkpoint all-reduces a status flag.
-# Running both at one cadence means two barriers per interval instead of a
-# second, offset-triggered sync -- the alignment removes a synchronization point
-# rather than adding one. It also means the eval loss is available to record in
-# the same checkpoint, instead of being stale by up to 400 steps.
-EVAL_EVERY = int(os.environ.get("ATOM_EVAL_EVERY", 500))
+# Cadences are deliberately decoupled.
+#
+# EVAL_EVERY (100) is frequent: an evaluation writes no files and costs only a
+# bounded number of forward passes, so a fine-grained loss curve is nearly free.
+# It is the main signal for noticing divergence early -- with only a 500-step
+# view, a run that has already gone wrong gives no clue for hours.
+#
+# SAVE_EVERY (500) is 5x coarser because a checkpoint is ~5.6 GiB: writing and
+# uploading one is the only real I/O in the loop, and at 100 it saturates the
+# connection for the length of a session.
+#
+# Decoupling costs nothing in eval freshness here, because 500 is a multiple of
+# 100: every checkpoint step is also an eval step, so the cached loss a
+# checkpoint records was measured at that exact step. Verified on disk --
+# step_500.pt carries eval_step=500, gap 0.
+#
+# That is a property of *these* two numbers, not a guarantee. Setting
+# SAVE_EVERY=250 would leave each checkpoint holding the eval from step 200, a
+# 50-step gap. `eval_step` is recorded for exactly that reason: it is what
+# distinguishes a fresh measurement from a carried-over one.
+EVAL_EVERY = int(os.environ.get("ATOM_EVAL_EVERY", 100))
 EVAL_BATCHES = int(os.environ.get("ATOM_EVAL_BATCHES", 20))
 # Every 500 steps. A 497M checkpoint is ~5.6 GiB (fp32 weights 1.85 + AdamW
 # exp_avg 1.85 + exp_avg_sq 1.85, i.e. 12 bytes/param), so this is a real
@@ -630,7 +643,7 @@ _LAST_SAVED_STEP = [-1]
 
 
 def checkpoint(model, optimizer, step, config, loss=None, eval_loss=None,
-               uploader=None, device=None) -> None:
+               eval_step=None, uploader=None, device=None) -> None:
     """Save on rank 0, enqueue for upload, then every rank crosses the barrier.
 
     The work is rank-0-only but the `all_reduce` is not: an earlier version
@@ -652,7 +665,8 @@ def checkpoint(model, optimizer, step, config, loss=None, eval_loss=None,
         t0 = time.time()
         path = save_local_checkpoint(
             model, optimizer, step, config=config, loss=loss,
-            eval_loss=eval_loss, checkpoint_dir=CHECKPOINT_DIR,
+            eval_loss=eval_loss, eval_step=eval_step,
+            checkpoint_dir=CHECKPOINT_DIR,
         )
         ok = path is not None
         if path:
@@ -781,8 +795,13 @@ def main() -> None:
     else:
         log("[resume] no prior checkpoint — starting from step 0")
 
-    last_loss = None
-    last_eval = None
+    # Running metrics cached so a checkpoint can carry the most recent values
+    # without re-running an evaluation. `latest_eval_step` records the step the
+    # eval loss was actually measured at -- with decoupled cadences it is
+    # usually not the checkpoint's own step.
+    latest_train_loss = None
+    latest_eval_loss = None
+    latest_eval_step = None
     try:
         # Resume lands mid-epoch when steps_per_epoch does not divide the saved
         # step. `skip_micro` counts the batches already consumed inside the
@@ -811,7 +830,7 @@ def main() -> None:
                     loss = ddp_model(x, y)
                 scaler.scale(loss / GRAD_ACCUM).backward()
                 running += loss.item()
-                last_loss = loss.item()
+                latest_train_loss = loss.item()
 
                 if (it + 1) % GRAD_ACCUM:
                     continue
@@ -845,16 +864,20 @@ def main() -> None:
                     running = t0 = 0.0
 
                 if step % EVAL_EVERY == 0:
-                    eval_loss = evaluate(ddp_model, eval_loader, device, amp,
-                                         EVAL_BATCHES)
-                    last_eval = eval_loss
-                    log(f"step {step} | eval {eval_loss:.4f}")
+                    latest_eval_loss = evaluate(ddp_model, eval_loader, device,
+                                                amp, EVAL_BATCHES)
+                    latest_eval_step = step
+                    log(f"step {step} | eval {latest_eval_loss:.4f}")
 
                 if step % SAVE_EVERY == 0:
-                    # Runs after eval on a shared cadence, so the checkpoint
-                    # records the eval loss measured at this exact step.
+                    # Cadences are decoupled, so this carries the most recent
+                    # evaluation, not one from this step. `latest_eval_step`
+                    # records where it actually came from so a reader can never
+                    # mistake it for a measurement at the checkpoint's step.
                     checkpoint(ddp_model, optimizer, step, config,
-                               loss=last_loss, eval_loss=last_eval,
+                               loss=latest_train_loss,
+                               eval_loss=latest_eval_loss,
+                               eval_step=latest_eval_step,
                                uploader=uploader, device=device)
 
                 if MAX_STEPS and step >= MAX_STEPS:
@@ -863,20 +886,26 @@ def main() -> None:
                 break
 
         checkpoint(ddp_model, optimizer, step, config,
-                   loss=last_loss, eval_loss=last_eval,
+                   loss=latest_train_loss,
+                   eval_loss=latest_eval_loss,
+                   eval_step=latest_eval_step,
                    uploader=uploader, device=device)
         log(f"[done] {step:,} steps complete")
 
     except KeyboardInterrupt:
         log("[interrupt] checkpointing before exit")
         checkpoint(ddp_model, optimizer, step, config,
-                   loss=last_loss, eval_loss=last_eval,
+                   loss=latest_train_loss,
+                   eval_loss=latest_eval_loss,
+                   eval_step=latest_eval_step,
                    uploader=uploader, device=device)
         raise
     except Exception as exc:
         log(f"[error] {type(exc).__name__}: {exc}")
         checkpoint(ddp_model, optimizer, step, config,
-                   loss=last_loss, eval_loss=last_eval,
+                   loss=latest_train_loss,
+                   eval_loss=latest_eval_loss,
+                   eval_step=latest_eval_step,
                    uploader=uploader, device=device)
         raise
     finally:

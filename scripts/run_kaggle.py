@@ -186,7 +186,7 @@ env.update({{
     "ATOM_GRAD_ACCUM": "4",        # 4 x 4 x 2 GPUs x 2048 = 65,536 tok/step
     "ATOM_LR": "3e-4",
     "ATOM_SAVE_EVERY": "500",
-    "ATOM_EVAL_EVERY": "500",   # aligned: one eval per checkpoint interval
+    "ATOM_EVAL_EVERY": "100",    # decoupled: eval is free, checkpointing is not
     "TOKENIZERS_PARALLELISM": "false",
     "PYTHONUNBUFFERED": "1",       # stream logs to the notebook as they happen
 }})
