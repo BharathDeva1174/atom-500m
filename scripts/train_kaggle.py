@@ -233,28 +233,22 @@ def ensure_shards() -> None:
         local_dir=".",
     )
 
-    if not any(SHARD_DIR.glob("*.bin")):
-        # The corpus was uploaded with --path_in_repo data, so the Hub layout
-        # is data/shard_NNNN.bin and snapshot_download preserves it under
-        # local_dir -- one level above ATOM_SHARD_DIR (data/shards). The 444 MB
-        # is already on disk; moving it down beats failing the run.
-        stray = sorted(SHARD_DIR.parent.glob("*.bin"))
-        if stray:
-            for p in stray:
-                try:
-                    p.rename(SHARD_DIR / p.name)
-                except FileNotFoundError:
-                    # Both ranks run ensure_shards concurrently; the other one
-                    # may have moved this file first.
-                    pass
-            log(f"[data] reconciled shards from {SHARD_DIR.parent}/ into "
-                f"{SHARD_DIR}/")
-        # The move itself races with the other rank: wait briefly for it to
-        # finish rather than failing on a half-moved directory.
-        for _ in range(30):
-            if any(SHARD_DIR.glob("*.bin")):
-                break
-            time.sleep(2)
+    # Reconcile the Hub layout (data/shard_NNNN.bin) with the trainer's layout
+    # (data/shards/). Unconditional -- a crashed earlier run can leave shards
+    # SPLIT between the two directories, and a non-empty data/shards must not
+    # skip reconciliation of the remaining strays. Both ranks run this
+    # concurrently: every rename tolerates the sibling having moved the file
+    # first, and the count check waits out a mid-move sibling rather than
+    # failing on a half-reconciled directory.
+    for p in sorted(SHARD_DIR.parent.glob("*.bin")):
+        try:
+            p.rename(SHARD_DIR / p.name)
+        except (FileNotFoundError, OSError):
+            pass
+    for _ in range(30):
+        if any(SHARD_DIR.glob("*.bin")):
+            break
+        time.sleep(2)
 
     n = len(sorted(SHARD_DIR.glob("*.bin")))
     if not n:
