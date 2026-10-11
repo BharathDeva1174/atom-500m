@@ -241,9 +241,20 @@ def ensure_shards() -> None:
         stray = sorted(SHARD_DIR.parent.glob("*.bin"))
         if stray:
             for p in stray:
-                p.rename(SHARD_DIR / p.name)
-            log(f"[data] moved {len(stray)} shard(s) from "
-                f"{SHARD_DIR.parent}/ into {SHARD_DIR}/")
+                try:
+                    p.rename(SHARD_DIR / p.name)
+                except FileNotFoundError:
+                    # Both ranks run ensure_shards concurrently; the other one
+                    # may have moved this file first.
+                    pass
+            log(f"[data] reconciled shards from {SHARD_DIR.parent}/ into "
+                f"{SHARD_DIR}/")
+        # The move itself races with the other rank: wait briefly for it to
+        # finish rather than failing on a half-moved directory.
+        for _ in range(30):
+            if any(SHARD_DIR.glob("*.bin")):
+                break
+            time.sleep(2)
 
     n = len(sorted(SHARD_DIR.glob("*.bin")))
     if not n:
