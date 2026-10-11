@@ -228,13 +228,21 @@ each. At `SAVE_EVERY=100` on Kaggle's ~20 GB disk, the last **2** checkpoints
 | `ATOM_EVAL_EVERY` | 100 | Steps between evaluations. Free (no I/O), so it runs 5× more often than checkpointing for a finer loss curve. |
 | `ATOM_UPLOAD_QUEUE` | 3 | Max unsent checkpoints before the oldest is dropped. |
 | `ATOM_UPLOAD_JOIN_TIMEOUT` | 300 | Seconds to wait for the queue at exit. |
-| `ATOM_KEEP_LOCAL_COUNT` | 2 | Uploaded checkpoints retained on disk. |
-| `ATOM_KEEP_LOCAL` | 0 | Set 1 to retain *every* checkpoint (disk permitting). |
+| `ATOM_KEEP_LOCAL_COUNT` | 2 | Confirmed checkpoints retained on disk. `1` deletes after upload; `0` keeps everything. |
+| `ATOM_KEEP_LOCAL` | — | Legacy alias: `1` → keep all, `0` → keep 1. Use `ATOM_KEEP_LOCAL_COUNT` instead. |
+
+**Retention is the only deletion policy.** The uploader marks a file confirmed;
+`cleanup_stale_checkpoints` decides what is removed, keeping the last
+`ATOM_KEEP_LOCAL_COUNT` confirmed checkpoints. There is deliberately no
+delete-on-upload-success path: an earlier version had both, and the faster one
+always won — the uploader removed each file the moment its upload finished, so
+the retention count had nothing left to retain and keep-2 silently did nothing.
+Verified by mutation: with delete-on-upload reinstated, **0 of 6** checkpoints
+survive.
 
 **Retention never prunes an unconfirmed checkpoint.** A file still uploading is
 protected, even if it is the oldest — deleting the only local copy of a step that
-hasn't reached the Hub would leave a failed upload with no recovery. Retention
-applies only to checkpoints confirmed on the Hub.
+hasn't reached the Hub would leave a failed upload with no recovery.
 
 **Only the save is synchronous.** `torch.save` reads tensors the training loop
 is concurrently mutating — the optimizer state especially — so serializing it

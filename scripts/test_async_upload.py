@@ -109,8 +109,12 @@ def test_worker_resilience():
 
     check("failure counted", up.failed == 1, f"failed={up.failed}")
     check("good uploads succeeded", up.uploaded == 2, f"uploaded={up.uploaded}")
-    check("uploaded files deleted after success",
-          set(remaining) == {"bad.pt"}, str(remaining))
+    # Successful uploads are NOT deleted by the uploader -- retention owns
+    # deletion, so keep-2 actually retains two. A failed upload leaves its file
+    # behind, which is the whole point of retaining a local fallback.
+    check("no file deleted by the uploader itself",
+          set(remaining) == {"step_1.pt", "bad.pt", "step_3.pt"},
+          str(sorted(remaining)))
 
 
 def test_close_drains():
@@ -398,6 +402,106 @@ def test_round_trip_into_model():
               == sd["wte.weight"].untyped_storage().data_ptr())
 
 
+def test_retention_is_actually_effective():
+    """Keep-2 must retain two files. Regression guard.
+
+    Deleting on upload success and pruning by retention count were two
+    independent policies over the same files. The delete won, because it ran
+    first and left the pruner nothing to retain -- so KEEP_LOCAL_COUNT=2 was a
+    silent no-op and a run kept no local fallback at all. These checks drive a
+    real uploader through several checkpoints and assert files remain.
+    """
+    print("\n[retention is effective]")
+    import train_kaggle as K
+
+    class FakeApi:
+        def __init__(self, token=None, **kw):
+            self.calls = []
+
+        def upload_file(self, path_or_fileobj, path_in_repo, repo_id,
+                        commit_message=None, **kw):
+            self.calls.append(path_in_repo)
+
+    import huggingface_hub
+    real = huggingface_hub.HfApi
+    # The worker does `from huggingface_hub import HfApi` *inside* the thread,
+    # which re-resolves the attribute at call time -- so patching the module
+    # attribute is both necessary and sufficient, as long as it is in place
+    # before start().
+    huggingface_hub.HfApi = FakeApi
+    try:
+        up = K.AsyncUploader("test/repo", token="x", max_pending=10)
+        up.start()
+        check("worker thread started", up._thread is not None
+              and up._thread.is_alive(), "")
+        check("uploader has no delete_after knob",
+              not hasattr(up, "delete_after"),
+              "delete-after-upload would override retention")
+
+        with tempfile.TemporaryDirectory() as td:
+            for step in (100, 200, 300, 400, 500, 600):
+                p = os.path.join(td, f"step_{step}.pt")
+                open(p, "wb").write(b"x")
+                up.submit(p)
+                # Wait for the upload to be confirmed before pruning. In a real
+                # run the gap is ~500 optimizer steps, so uploads keep pace
+                # trivially; submitting six instantly would legitimately leave
+                # all six protected, which is correct behavior, not a bug.
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    if os.path.abspath(p) in up.confirmed():
+                        break
+                    time.sleep(0.02)
+                K.cleanup_stale_checkpoints(td, keep=K.KEEP_LOCAL_COUNT,
+                                            protect=up.in_flight(td))
+            up.close(timeout=20)
+            left = sorted(os.listdir(td))
+
+        check("all six were uploaded", up.uploaded == 6, str(up.uploaded))
+        check("retention kept the expected number of files",
+              len(left) == K.KEEP_LOCAL_COUNT,
+              f"{len(left)} of 6 remain: {left}")
+        check("kept files are the newest", left == ["step_500.pt", "step_600.pt"],
+              str(left))
+    finally:
+        huggingface_hub.HfApi = real
+
+
+def test_legacy_keep_local_alias():
+    """ATOM_KEEP_LOCAL must still map onto the retention count."""
+    print("\n[legacy ATOM_KEEP_LOCAL alias]")
+    import importlib
+
+    import train_kaggle as K
+
+    def load(env):
+        old = {k: os.environ.get(k) for k in env}
+        for k in env:
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        try:
+            importlib.reload(K)
+            return K.KEEP_LOCAL_COUNT
+        finally:
+            for k in env:
+                os.environ.pop(k, None)
+            if old:
+                os.environ.update({k: v for k, v in old.items() if v is not None})
+            importlib.reload(K)
+
+    check("default is 2", load({}) == 2, str(load({})))
+    check("ATOM_KEEP_LOCAL=1 -> keep all (0)", load({"ATOM_KEEP_LOCAL": "1"}) == 0,
+          str(load({"ATOM_KEEP_LOCAL": "1"})))
+    check("ATOM_KEEP_LOCAL=0 -> keep 1",
+          load({"ATOM_KEEP_LOCAL": "0"}) == 1, str(load({"ATOM_KEEP_LOCAL": "0"})))
+    check("explicit COUNT wins over legacy",
+          load({"ATOM_KEEP_LOCAL": "1", "ATOM_KEEP_LOCAL_COUNT": "3"}) == 3,
+          str(load({"ATOM_KEEP_LOCAL": "1", "ATOM_KEEP_LOCAL_COUNT": "3"})))
+    check("COUNT=1 gives old delete-after-upload behavior",
+          load({"ATOM_KEEP_LOCAL_COUNT": "1"}) == 1,
+          str(load({"ATOM_KEEP_LOCAL_COUNT": "1"})))
+
+
 if __name__ == "__main__":
     print("=" * 66)
     print("AsyncUploader verification")
@@ -411,6 +515,8 @@ if __name__ == "__main__":
     test_round_trip_into_model()
     test_eval_save_alignment()
     test_cached_eval_semantics()
+    test_retention_is_actually_effective()
+    test_legacy_keep_local_alias()
     print("\n" + "=" * 66)
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): " + ", ".join(FAILURES))

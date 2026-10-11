@@ -130,13 +130,30 @@ GRAD_CHECKPOINTING = os.environ.get("ATOM_GRAD_CHECKPOINT", "0") == "1"
 # is slower than training; the timeout stops a hung upload from blocking exit.
 UPLOAD_QUEUE = int(os.environ.get("ATOM_UPLOAD_QUEUE", 3))
 UPLOAD_JOIN_TIMEOUT = float(os.environ.get("ATOM_UPLOAD_JOIN_TIMEOUT", 300.0))
-DELETE_AFTER_UPLOAD = os.environ.get("ATOM_KEEP_LOCAL", "0") != "1"
-# How many uploaded checkpoints to retain locally. Measured at ~5.6 GiB each,
+# How many confirmed checkpoints to retain locally. Measured at ~5.6 GiB each,
 # so 2 is ~11.2 GiB -- comfortable on Kaggle's ~20 GB alongside a 0.43 GiB
-# corpus, but only while uploads keep pace. Retention is applied *after* a
-# successful upload, so a checkpoint whose upload failed is never pruned: that
-# is the fallback this retention exists to provide.
+# corpus, but only while uploads keep pace.
+#
+# This is the single deletion policy, and it deliberately supersedes the older
+# ATOM_KEEP_LOCAL / delete-after-upload pair. Those were independent settings,
+# which was a bug: with delete-after-upload on (the default) the uploader
+# removed each file the moment its upload finished, so the retention count had
+# nothing left to retain and keep-2 silently did nothing. Retention by count is
+# strictly more expressive -- 1 gives the old "delete after upload" behavior --
+# so one setting replaces two.
+#
+# Deletion only ever touches checkpoints confirmed on the Hub. A file still
+# uploading is protected regardless of age, because it is the only local copy:
+# if that upload then fails, pruning it would leave the run unresumable.
 KEEP_LOCAL_COUNT = int(os.environ.get("ATOM_KEEP_LOCAL_COUNT", 2))
+
+# Backwards-compatible alias. ATOM_KEEP_LOCAL=1 meant "keep every checkpoint",
+# which is ATOM_KEEP_LOCAL_COUNT=0 (retain all); =0 meant the old default of
+# delete-immediately, which is a count of 1. Without this, a user carrying
+# ATOM_KEEP_LOCAL=1 from an earlier version would silently lose all retention.
+_legacy_keep = os.environ.get("ATOM_KEEP_LOCAL")
+if _legacy_keep is not None and "ATOM_KEEP_LOCAL_COUNT" not in os.environ:
+    KEEP_LOCAL_COUNT = 0 if _legacy_keep == "1" else 1
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
@@ -450,13 +467,16 @@ class AsyncUploader:
         token: Optional[str] = None,
         path_in_repo: str = "checkpoints",
         max_pending: int = 3,
-        delete_after: bool = True,
     ):
         self.repo_id = repo_id
         self.token = token
         self.path_in_repo = path_in_repo
         self.max_pending = max_pending
-        self.delete_after = delete_after
+        # Note there is no delete-after-upload here. Deleting on upload success
+        # and pruning by retention count were two policies fighting over the same
+        # files, and the faster one always won -- leaving the retention count a
+        # no-op. The uploader now only marks a file confirmed; cleanup decides
+        # what actually gets removed, and it is driven by KEEP_LOCAL_COUNT.
 
         self._queue: "queue.Queue" = queue.Queue(maxsize=max_pending)
         self._thread: Optional[threading.Thread] = None
@@ -578,8 +598,10 @@ class AsyncUploader:
                     self.uploaded += 1
                     self._confirmed.add(os.path.abspath(path))
                 print(f"[upload] {name} -> {remote} ({time.time() - t0:.1f}s)")
-                if self.delete_after:
-                    _quiet_remove(path)
+                # Not deleted here -- cleanup_stale_checkpoints applies
+                # KEEP_LOCAL_COUNT. Deleting at upload time would leave nothing
+                # to retain and would discard the local fallback before the
+                # next checkpoint exists.
             except Exception as exc:
                 # A failed upload must not kill the thread: the run should
                 # continue and keep checkpointing.
@@ -745,8 +767,12 @@ def main() -> None:
     )
     steps_per_epoch = len(train_loader) // GRAD_ACCUM
     total_steps = MAX_STEPS or steps_per_epoch
+    # Trust the same retention budget used during the run. Startup cleanup at a
+    # different count would prune the extra resume point the previous session
+    # deliberately kept -- e.g. keep=1 here would delete the step-0 checkpoint
+    # on startup, before any new save existed to replace it.
     if is_main():
-        cleanup_stale_checkpoints(CHECKPOINT_DIR, keep=1)
+        cleanup_stale_checkpoints(CHECKPOINT_DIR, keep=KEEP_LOCAL_COUNT)
 
     eff_tokens = BATCH_SIZE * GRAD_ACCUM * world_size * config["block_size"]
     log(f"[train] {steps_per_epoch} steps/epoch | total {total_steps:,} | "
@@ -758,7 +784,7 @@ def main() -> None:
     if is_main() and HF_TOKEN:
         uploader = AsyncUploader(
             repo_id=HF_REPO, token=HF_TOKEN, path_in_repo="checkpoints",
-            max_pending=UPLOAD_QUEUE, delete_after=DELETE_AFTER_UPLOAD,
+            max_pending=UPLOAD_QUEUE,
         )
         uploader.start()
     elif is_main():
