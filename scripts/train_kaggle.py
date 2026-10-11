@@ -232,6 +232,19 @@ def ensure_shards() -> None:
         token=HF_TOKEN or None,
         local_dir=".",
     )
+
+    if not any(SHARD_DIR.glob("*.bin")):
+        # The corpus was uploaded with --path_in_repo data, so the Hub layout
+        # is data/shard_NNNN.bin and snapshot_download preserves it under
+        # local_dir -- one level above ATOM_SHARD_DIR (data/shards). The 444 MB
+        # is already on disk; moving it down beats failing the run.
+        stray = sorted(SHARD_DIR.parent.glob("*.bin"))
+        if stray:
+            for p in stray:
+                p.rename(SHARD_DIR / p.name)
+            log(f"[data] moved {len(stray)} shard(s) from "
+                f"{SHARD_DIR.parent}/ into {SHARD_DIR}/")
+
     n = len(sorted(SHARD_DIR.glob("*.bin")))
     if not n:
         raise SystemExit(
@@ -813,7 +826,19 @@ def main() -> None:
             path = find_latest_checkpoint(CHECKPOINT_DIR)
 
     if path:
-        start_step = load_checkpoint(path, ddp_model, optimizer)
+        try:
+            start_step = load_checkpoint(path, ddp_model, optimizer)
+        except RuntimeError as exc:
+            # Architecture drift between the checkpoint and the current config
+            # (e.g. wpe 1024x1024 vs 2048x1024 after a block_size change) makes
+            # the file unusable. Same policy as a failed remote lookup in
+            # maybe_resume(): training from scratch beats not training at all.
+            # Every rank loads the same file, so they all take this branch and
+            # stay in agreement on step 0.
+            log(f"[resume] {os.path.basename(path)} is incompatible with the "
+                f"current config: {str(exc).splitlines()[0][:140]}")
+            log("[resume] starting from step 0")
+            start_step = 0
         step = start_step
         start_epoch = start_step // max(1, steps_per_epoch)
         _LAST_SAVED_STEP[0] = start_step

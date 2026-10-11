@@ -96,15 +96,18 @@ assert torch.cuda.is_available(), "CUDA unavailable; the accelerator is off."
 # --- 3. clone the repository ----------------------------------------------
 REPO_URL = "{repo_url}"
 REPO_DIR = "{repo_dir}"
+# Anchor absolutely: os.chdir persists in the kernel, so a relative REPO_DIR
+# nests one level deeper on every cell re-run (atom-500m/atom-500m/...).
+REPO_ROOT = os.path.join("/kaggle/working", REPO_DIR)
 
-if os.path.isdir(REPO_DIR):
+if os.path.isdir(os.path.join(REPO_ROOT, ".git")):
     # Already cloned in an earlier cell of this notebook session.
-    print(f"{{REPO_DIR}} already exists — pulling latest instead of cloning")
-    subprocess.run(["git", "-C", REPO_DIR, "pull", "--ff-only"], check=False)
+    print(f"{{REPO_ROOT}} already exists — pulling latest instead of cloning")
+    subprocess.run(["git", "-C", REPO_ROOT, "pull", "--ff-only"], check=False)
 else:
-    subprocess.run(["git", "clone", "{repo_url}"], check=True)
+    subprocess.run(["git", "clone", "{repo_url}", REPO_ROOT], check=True)
 
-os.chdir(REPO_DIR)
+os.chdir(REPO_ROOT)
 print("cwd:", os.getcwd())
 '''
     )
@@ -125,36 +128,45 @@ print("dependencies installed from requirements.txt")
             f'''\
 # --- 5. training corpus ----------------------------------------------------
 # Preferred: uint16 .bin shards built by scripts/prepare_dataset.py.
-# Attach a Kaggle dataset containing the shards, or build them here from raw
-# dialogue JSONL / a Hugging Face dataset.
+# Sources, in order: (1) shards copied from an attached Kaggle dataset,
+# (2) built here from RAW_JSONL / HF_DATASET, (3) downloaded from the
+# Hugging Face Hub by train_kaggle.py (ensure_shards) after launch.
 SHARD_DIR = "data/shards"
+os.makedirs(SHARD_DIR, exist_ok=True)
 
-if not os.path.isdir(SHARD_DIR) or not any(
-    f.endswith(".bin") for f in os.listdir(SHARD_DIR)
-):
-    print(f"No shards in {{SHARD_DIR}} — building them.")
-    print("Set RAW_JSONL or HF_DATASET below to point at your dialogue corpus.")
+def _attached_shards():
+    import glob
+    return [p for p in glob.glob("/kaggle/input/**/*.bin", recursive=True)
+            if os.path.getsize(p) > 1_000_000]
 
-    RAW_JSONL = os.environ.get("RAW_JSONL", "")
-    HF_DATASET = os.environ.get("HF_DATASET", "")
-
-    cmd = [sys.executable, "scripts/prepare_dataset.py",
-           "--out_dir", SHARD_DIR, "--block_size", "2048"]
-    if RAW_JSONL:
-        cmd += ["--input", RAW_JSONL]
-    if HF_DATASET:
-        cmd += ["--hf_dataset", HF_DATASET]
-
-    if RAW_JSONL or HF_DATASET:
-        subprocess.run(cmd, check=True)
+if not any(f.endswith(".bin") for f in os.listdir(SHARD_DIR)):
+    print("No shards in", SHARD_DIR, "- looking for a source ...")
+    print("/kaggle/input:",
+          os.listdir("/kaggle/input") if os.path.isdir("/kaggle/input") else "(nothing attached)")
+    attached = _attached_shards()
+    if attached:
+        import shutil
+        print(f"copying {{len(attached)}} shard(s) from /kaggle/input ...")
+        for p in attached:
+            shutil.copy2(p, SHARD_DIR)
     else:
-        raise FileNotFoundError(
-            f"{{SHARD_DIR}} is empty and no corpus was specified.\\n"
-            f"Attach a Kaggle dataset of .bin shards under data/shards/, or set\\n"
-            f"  RAW_JSONL=/kaggle/input/<dataset>/dialogues.jsonl\\n"
-            f"  HF_DATASET=empathetic/empathetic_dialogues\\n"
-            f"and re-run this cell."
-        )
+        RAW_JSONL = os.environ.get("RAW_JSONL", "")
+        HF_DATASET = os.environ.get("HF_DATASET", "")
+
+        cmd = [sys.executable, "scripts/prepare_dataset.py",
+               "--out_dir", SHARD_DIR, "--block_size", "2048"]
+        if RAW_JSONL:
+            cmd += ["--input", RAW_JSONL]
+        if HF_DATASET:
+            cmd += ["--hf_dataset", HF_DATASET]
+
+        if RAW_JSONL or HF_DATASET:
+            subprocess.run(cmd, check=True)
+        else:
+            # Not an error: train_kaggle.py downloads data/*.bin from the Hub
+            # on first run. Raising here would block that path entirely.
+            print("No local shards or build inputs - deferring to the Hub "
+                  "download inside train_kaggle.py (ensure_shards).")
 
 shards = sorted(f for f in os.listdir(SHARD_DIR) if f.endswith(".bin"))
 n_bytes = sum(os.path.getsize(os.path.join(SHARD_DIR, s)) for s in shards)
