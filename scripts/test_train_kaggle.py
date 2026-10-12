@@ -153,6 +153,54 @@ def test_no_cuda_guard():
         check("no-GPU raises SystemExit", "GPU" in str(e), str(e)[:52])
 
 
+def test_truncated_shard_detected():
+    """A half-copied shard must not pass as a complete corpus.
+
+    Regression for the silent-short-corpus run: ensure_shards returned as soon
+    as any .bin existed, so a sibling DDP rank copying a shard made a partial
+    file look finished. The dataset then counted chunks from the truncated file
+    and trained on ~200M of 233M tokens with nothing logged as wrong.
+    """
+    import json as _json
+    import hashlib as _hashlib
+    import train_kaggle as K
+    from scripts.prepare_dataset import ShardWriter, write_manifest
+
+    print("\n[truncated shard detection]")
+    with tempfile.TemporaryDirectory() as td:
+        root = __import__("pathlib").Path(td)
+        shard_dir = root / "shards"
+        w = ShardWriter(str(shard_dir), block_size=128,
+                        shard_bytes=4098 * 6, prefix="shard_")
+        rng = np.random.default_rng(1)
+        for _ in range(300):
+            w.add(rng.integers(0, 50257, size=250).tolist())
+        w.finalize()
+        write_manifest(str(shard_dir), block_size=128)
+
+        K.SHARD_DIR = shard_dir
+        check("_corpus_complete on a fresh manifest", K._corpus_complete(
+            _json.loads((root / "MANIFEST.json").read_text()), verify_sha=True))
+
+        # Chop the last shard in half -- exactly what a mid-copy glob sees.
+        victim = sorted(shard_dir.glob("*.bin"))[-1]
+        full = victim.read_bytes()
+        victim.write_bytes(full[: len(full) // 2])
+
+        man = _json.loads((root / "MANIFEST.json").read_text())
+        check("truncated shard fails _shard_matches",
+              not K._shard_matches(victim, man["shards"][-1], verify_sha=False),
+              f"{victim.stat().st_size:,} != {man['shards'][-1]['bytes']:,}")
+        check("truncated shard fails sha256 verify",
+              not K._shard_matches(victim, man["shards"][-1], verify_sha=True))
+        check("corpus reports incomplete", not K._corpus_complete(man, False))
+
+        # Repair restores the verified state.
+        victim.write_bytes(full)
+        check("repaired corpus verifies again",
+              K._corpus_complete(man, verify_sha=True))
+
+
 if __name__ == "__main__":
     print("=" * 66)
     print("train_kaggle.py verification")
@@ -161,6 +209,7 @@ if __name__ == "__main__":
     test_lr_schedule()
     test_optimizer_groups()
     test_loaders_over_real_shards()
+    test_truncated_shard_detected()
     test_effective_batch_math()
     test_no_cuda_guard()
     print("\n" + "=" * 66)

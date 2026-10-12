@@ -27,6 +27,7 @@ asserts the values match the documented spec instead.
 """
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -194,17 +195,84 @@ def verify_config(skip: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-def ensure_shards() -> None:
-    """Make sure ./data/shards/ holds .bin files, downloading if needed.
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 22), b""):
+            h.update(block)
+    return h.hexdigest()
 
-    A Kaggle notebook starts with an empty filesystem, so the corpus has to be
-    fetched from the Hub. Skipped when shards are already present, so a re-run
-    in the same session does not re-download 444 MB.
+
+def _read_manifest(root: Path) -> Optional[dict]:
+    """Load a corpus manifest from `root`, or None if there isn't one."""
+    for cand in (root / "MANIFEST.json", root / "data" / "MANIFEST.json"):
+        try:
+            return json.loads(cand.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return None
+
+
+def _shard_matches(path: Path, spec: dict, verify_sha: bool) -> bool:
+    """True when `path` is the complete shard `spec` describes."""
+    if not path.exists():
+        return False
+    if spec.get("bytes") is not None and path.stat().st_size != spec["bytes"]:
+        return False
+    if verify_sha and spec.get("sha256"):
+        return _sha256(path) == spec["sha256"]
+    return True
+
+
+def _corpus_complete(manifest: dict, verify_sha: bool) -> bool:
+    return all(
+        _shard_matches(SHARD_DIR / s["name"], s, verify_sha)
+        for s in manifest["shards"]
+    )
+
+
+def _atomic_copy(src: Path, dst: Path) -> None:
+    """Copy via a temp name and rename, so `dst` is never seen half-written.
+
+    Both DDP ranks call ensure_shards, and a direct copy2 leaves a partially
+    written shard visible under its real name for as long as the copy takes.
+    The rename is atomic, so any reader -- including the sibling rank's
+    glob -- only ever sees a complete file.
     """
-    existing = sorted(SHARD_DIR.glob("*.bin"))
-    if existing:
-        log(f"[data] {len(existing)} shard(s) already present in {SHARD_DIR}")
-        return
+    tmp = dst.with_suffix(dst.suffix + f".tmp{os.getpid()}")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
+def ensure_shards() -> None:
+    """Make sure ./data/shards/ holds the complete corpus, verified.
+
+    Presence is NOT evidence. An earlier version returned as soon as any .bin
+    existed, so a sibling rank that was mid-copy made a half-written shard look
+    like a finished one: the run then trained on ~200M tokens instead of 233M
+    with no error anywhere. Every shard is now checked against the manifest
+    published alongside the corpus (size, plus sha256 unless ATOM_VERIFY_SHA=0)
+    and anything missing or short is re-fetched.
+    """
+    verify_sha = os.environ.get("ATOM_VERIFY_SHA", "1") == "1"
+    local_manifest_path = SHARD_DIR.parent / "MANIFEST.json"
+
+    cached = _read_manifest(SHARD_DIR.parent) or _read_manifest(SHARD_DIR)
+    if cached:
+        # Fast path: a complete, verified corpus is already here.
+        if _corpus_complete(cached, verify_sha):
+            log(f"[data] corpus verified: {len(cached['shards'])} shard(s), "
+                f"{cached.get('tokens', 0):,} tokens")
+            return
+    else:
+        # Shards from an attached dataset carry no manifest. Serve them, but
+        # say plainly that nothing vouches for their completeness -- the exact
+        # silence that let a short corpus through before.
+        existing = sorted(SHARD_DIR.glob("*.bin"))
+        if existing:
+            log(f"[data] {len(existing)} shard(s) present, no MANIFEST.json — "
+                f"integrity unverified")
+            return
 
     if not DOWNLOAD:
         raise FileNotFoundError(
@@ -226,43 +294,77 @@ def ensure_shards() -> None:
         )
 
     log(f"[data] downloading data/ from {HF_REPO} ...")
-    snapshot_path = snapshot_download(
+    snapshot_path = Path(snapshot_download(
         repo_id=HF_REPO,
         repo_type="dataset" if os.environ.get("HF_REPO_TYPE") == "dataset" else "model",
-        allow_patterns=["data/*.bin"],
+        allow_patterns=["data/*.bin", "data/MANIFEST.json"],
         token=HF_TOKEN or None,
-    )
+    ))
 
     # Copy out of the Hub cache instead of moving. local_dir="." cannot be
     # reconciled after the fact: moving a downloaded file away leaves the
     # local_dir metadata claiming it exists, so every later download is a
     # cache hit that never re-materializes the file ("Fetching 5 files 100%"
-    # followed by an empty data/). The cache stays intact, so re-runs are
-    # instant and both ranks can copy concurrently (copy2 of identical bytes
-    # is race-safe; the exists() check usually avoids the double write).
-    src_dir = Path(snapshot_path) / "data"
+    # followed by an empty data/).
+    src_dir = snapshot_path / "data"
     SHARD_DIR.mkdir(parents=True, exist_ok=True)
-    n = 0
-    if src_dir.is_dir():
-        for p in sorted(src_dir.glob("*.bin")):
-            target = SHARD_DIR / p.name
-            if not target.exists():
-                shutil.copy2(p, target)
-            n += 1
-    else:
-        # Snapshot layouts vary; fall back to walking the whole snapshot.
-        for p in sorted(Path(snapshot_path).rglob("*.bin")):
-            target = SHARD_DIR / p.name
-            if not target.exists():
-                shutil.copy2(p, target)
-            n += 1
+    manifest = _read_manifest(snapshot_path) or cached
 
+    if manifest:
+        # Keep a local copy so a re-run verifies without touching the Hub.
+        try:
+            local_manifest_path.write_text(json.dumps(manifest, indent=2) + "\n",
+                                           encoding="utf-8")
+        except OSError:
+            pass
+        wanted = manifest["shards"]
+    else:
+        log("[data] WARNING: no MANIFEST.json on the Hub -- integrity cannot be "
+            "verified; falling back to size-only checks")
+        found = sorted(src_dir.glob("*.bin")) if src_dir.is_dir() else []
+        wanted = [{"name": p.name, "bytes": p.stat().st_size, "sha256": None}
+                  for p in (found or sorted(Path(snapshot_path).rglob("*.bin")))]
+
+    for spec in wanted:
+        target = SHARD_DIR / spec["name"]
+        if _shard_matches(target, spec, verify_sha):
+            continue
+        src = src_dir / spec["name"]
+        if not src.exists():
+            log(f"[data] missing from the Hub: {spec['name']}")
+            continue
+        if target.exists():
+            log(f"[data] re-fetching {spec['name']} (size "
+                f"{target.stat().st_size:,} != {spec.get('bytes', 0):,})")
+        _atomic_copy(src, target)
+
+    # The sibling rank may still be copying. Renames are atomic, so re-checking
+    # until the set is complete is safe -- and is the only thing standing
+    # between a slow copy and a silently short corpus.
+    if manifest:
+        for _ in range(30):
+            if _corpus_complete(manifest, verify_sha):
+                break
+            time.sleep(2)
+        if not _corpus_complete(manifest, verify_sha):
+            missing = [s["name"] for s in manifest["shards"]
+                       if not _shard_matches(SHARD_DIR / s["name"], s, verify_sha)]
+            raise SystemExit(
+                f"corpus incomplete after download; still wrong or missing: "
+                f"{', '.join(missing)}. Re-run to retry."
+            )
+        log(f"[data] corpus verified: {len(manifest['shards'])} shard(s), "
+            f"{manifest.get('tokens', 0):,} tokens, "
+            f"{manifest.get('chunks', 0):,} chunks")
+        return
+
+    n = len(list(SHARD_DIR.glob("*.bin")))
     if not n:
         raise SystemExit(
             f"download completed but no .bin files landed in {SHARD_DIR}. "
             f"Check that {HF_REPO} has a data/ folder containing shards."
         )
-    log(f"[data] downloaded {n} shard(s)")
+    log(f"[data] downloaded {n} shard(s) (unverified)")
 
 
 def build_loaders(config: dict, rank: int, world_size: int):

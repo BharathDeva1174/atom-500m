@@ -33,6 +33,7 @@ a wrapped token is still a valid-looking number.
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -40,6 +41,7 @@ import sys
 import time
 import unicodedata
 from collections import defaultdict
+from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence
 
 import numpy as np
@@ -938,6 +940,65 @@ def verify_shards(out_dir: str, block_size: int = 2048, vocab_size: int = GPT2_V
         ds.close()
 
 
+def write_manifest(
+    out_dir: str,
+    block_size: int = 2048,
+    path_in_repo: str = "data",
+    repo_id: str = "",
+    token: Optional[str] = None,
+) -> str:
+    """Write (and publish) data/MANIFEST.json describing the shard set.
+
+    The trainer verifies this before training: shard sizes, sha256 digests and
+    the expected chunk/token totals. Without it a half-written shard -- the
+    DDP race where one rank sees the other mid-copy -- looks like a complete
+    corpus and the run trains on a fraction of the data with no error.
+    """
+    shard_dir = Path(out_dir)
+    shards = []
+    total_tokens = total_chunks = 0
+    for p in sorted(shard_dir.glob("*.bin")):
+        n_bytes = p.stat().st_size
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for block in iter(lambda: f.read(1 << 22), b""):
+                h.update(block)
+        chunks, rem = divmod(n_bytes, 2 * (block_size + 1))
+        shards.append({
+            "name": p.name,
+            "bytes": n_bytes,
+            "sha256": h.hexdigest(),
+            "chunks": chunks,
+            "trailing_tokens": rem // 2,
+        })
+        total_chunks += chunks
+        total_tokens += chunks * (block_size + 1) + rem // 2
+
+    manifest = {
+        "format": 1,
+        "dtype": "uint16",
+        "block_size": block_size,
+        "tokens": total_tokens,
+        "chunks": total_chunks,
+        "shards": shards,
+    }
+    path = shard_dir.parent / "MANIFEST.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"[hf] manifest: {total_tokens:,} tokens, {total_chunks:,} chunks")
+
+    if repo_id:
+        from huggingface_hub import HfApi
+        HfApi(token=token).upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo=f"{path_in_repo}/MANIFEST.json",
+            repo_id=repo_id,
+            commit_message="data: MANIFEST.json",
+        )
+        print(f"[hf] uploaded {path_in_repo}/MANIFEST.json")
+    return str(path)
+
+
 def push_to_hf(
     out_dir: str,
     repo_id: str,
@@ -947,7 +1008,10 @@ def push_to_hf(
     """Upload the shard directory to the Hugging Face Hub.
 
     Uploads file-by-file rather than via upload_folder so a single bad file
-    cannot roll back an already-committed multi-GB upload.
+    cannot roll back an already-committed multi-GB upload. The manifest goes
+    up last, after every shard has landed, so its digests always describe the
+    set the trainer will actually fetch -- a manifest published alongside a
+    half-failed upload would make the trainer reject a corpus that is fine.
     """
     try:
         from huggingface_hub import HfApi
@@ -985,6 +1049,12 @@ def push_to_hf(
             # Keep going: one failed shard should not discard hours of upload.
             print(f"  [ERROR] {name}: {exc}")
 
+    if uploaded != len(shards):
+        print(f"[hf] skipped manifest: {len(shards) - uploaded} shard(s) failed, "
+              f"so its digests would not describe the published set")
+        return uploaded
+
+    write_manifest(out_dir, path_in_repo=path_in_repo, repo_id=repo_id, token=token)
     print(f"[hf] uploaded {uploaded}/{len(shards)} shards")
     return uploaded
 
