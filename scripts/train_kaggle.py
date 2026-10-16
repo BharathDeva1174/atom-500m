@@ -244,8 +244,8 @@ def _atomic_copy(src: Path, dst: Path) -> None:
     os.replace(tmp, dst)
 
 
-def ensure_shards() -> None:
-    """Make sure ./data/shards/ holds the complete corpus, verified.
+def _ensure_shards_local() -> bool:
+    """Validate/refresh ./data/shards/ on the calling rank. Returns success.
 
     Presence is NOT evidence. An earlier version returned as soon as any .bin
     existed, so a sibling rank that was mid-copy made a half-written shard look
@@ -253,6 +253,9 @@ def ensure_shards() -> None:
     with no error anywhere. Every shard is now checked against the manifest
     published alongside the corpus (size, plus sha256 unless ATOM_VERIFY_SHA=0)
     and anything missing or short is re-fetched.
+
+    Failures are returned rather than raised so the DDP wrapper can fail every
+    rank together; see ensure_shards.
     """
     verify_sha = os.environ.get("ATOM_VERIFY_SHA", "1") == "1"
     local_manifest_path = SHARD_DIR.parent / "MANIFEST.json"
@@ -263,7 +266,7 @@ def ensure_shards() -> None:
         if _corpus_complete(cached, verify_sha):
             log(f"[data] corpus verified: {len(cached['shards'])} shard(s), "
                 f"{cached.get('tokens', 0):,} tokens")
-            return
+            return True
     else:
         # Shards from an attached dataset carry no manifest. Serve them, but
         # say plainly that nothing vouches for their completeness -- the exact
@@ -272,13 +275,12 @@ def ensure_shards() -> None:
         if existing:
             log(f"[data] {len(existing)} shard(s) present, no MANIFEST.json — "
                 f"integrity unverified")
-            return
+            return True
 
     if not DOWNLOAD:
-        raise FileNotFoundError(
-            f"no shards in {SHARD_DIR} and ATOM_DOWNLOAD=0. Attach a Kaggle "
-            f"dataset containing data/shards/*.bin, or set ATOM_DOWNLOAD=1."
-        )
+        log("[data] no shards and ATOM_DOWNLOAD=0. Attach a Kaggle dataset "
+            "containing data/shards/*.bin, or set ATOM_DOWNLOAD=1.")
+        return False
 
     try:
         from huggingface_hub import snapshot_download
@@ -286,12 +288,11 @@ def ensure_shards() -> None:
         raise ImportError("huggingface_hub is required to download shards") from exc
 
     if not HF_TOKEN:
-        raise SystemExit(
-            f"No shards in {SHARD_DIR} and no HF_TOKEN set.\n"
-            f"On Kaggle, add HF_TOKEN as a notebook secret first:\n"
-            f"  from kaggle_secrets import UserSecretsClient\n"
-            f"  os.environ['HF_TOKEN'] = UserSecretsClient().get_secret('HF_TOKEN')"
-        )
+        log("[data] no shards and no HF_TOKEN set. On Kaggle, add HF_TOKEN as a "
+            "notebook secret first:\n"
+            "  from kaggle_secrets import UserSecretsClient\n"
+            "  os.environ['HF_TOKEN'] = UserSecretsClient().get_secret('HF_TOKEN')")
+        return False
 
     log(f"[data] downloading data/ from {HF_REPO} ...")
     snapshot_path = Path(snapshot_download(
@@ -338,9 +339,9 @@ def ensure_shards() -> None:
                 f"{target.stat().st_size:,} != {spec.get('bytes', 0):,})")
         _atomic_copy(src, target)
 
-    # The sibling rank may still be copying. Renames are atomic, so re-checking
-    # until the set is complete is safe -- and is the only thing standing
-    # between a slow copy and a silently short corpus.
+    # Renames are atomic, so a re-check can never see a half-written shard.
+    # Under DDP this runs on rank 0 alone; the single-process path just waits
+    # out its own copy.
     if manifest:
         for _ in range(30):
             if _corpus_complete(manifest, verify_sha):
@@ -349,22 +350,65 @@ def ensure_shards() -> None:
         if not _corpus_complete(manifest, verify_sha):
             missing = [s["name"] for s in manifest["shards"]
                        if not _shard_matches(SHARD_DIR / s["name"], s, verify_sha)]
-            raise SystemExit(
-                f"corpus incomplete after download; still wrong or missing: "
-                f"{', '.join(missing)}. Re-run to retry."
-            )
+            log(f"[data] corpus incomplete after download; still wrong or "
+                f"missing: {', '.join(missing)}. Re-run to retry.")
+            return False
         log(f"[data] corpus verified: {len(manifest['shards'])} shard(s), "
             f"{manifest.get('tokens', 0):,} tokens, "
             f"{manifest.get('chunks', 0):,} chunks")
-        return
+        return True
 
     n = len(list(SHARD_DIR.glob("*.bin")))
     if not n:
-        raise SystemExit(
-            f"download completed but no .bin files landed in {SHARD_DIR}. "
-            f"Check that {HF_REPO} has a data/ folder containing shards."
-        )
+        log(f"[data] download completed but no .bin files landed in "
+            f"{SHARD_DIR}. Check that {HF_REPO} has a data/ folder with shards.")
+        return False
     log(f"[data] downloaded {n} shard(s) (unverified)")
+    return True
+
+
+def ensure_shards() -> None:
+    """Ensure a complete, verified corpus on every rank before training.
+
+    Under DDP only rank 0 touches the Hub or the shard directory, then an
+    all-reduce agrees on the outcome and a barrier releases everyone. Two
+    reasons it is not left to each rank:
+
+      * A secondary rank can read data/shards while rank 0 is still copying
+        into it. Atomic renames mean it never sees a partial FILE, but it
+        can still see a directory that is missing shards.
+      * A rank that raises alone leaves its peers waiting in the next
+        collective, and the job hangs with no message. So the local function
+        returns a verdict, the verdict is all-reduced with MIN, and every
+        rank fails together.
+
+    Both collectives are entered by every rank -- the resume barrier deadlock
+    (NOTES.md section 4) was exactly a one-sided barrier.
+    """
+    if not (torch.distributed.is_available() and dist.is_initialized()):
+        if not _ensure_shards_local():
+            raise SystemExit("corpus unavailable; see the [data] lines above")
+        return
+
+    # Only rank 0's verdict counts. A non-main rank contributes True -- "I
+    # have no objection" -- because it deliberately did no work; voting False
+    # for that would veto a corpus rank 0 just validated.
+    ok = _ensure_shards_local() if is_main() else True
+    # Mirror setup()'s device choice: NCCL reduces CUDA tensors, gloo reduces
+    # CPU ones, and asking torch instead of following the harness puts the flag
+    # on a CUDA tensor under a gloo group -- which hangs rather than erroring.
+    if os.environ.get("ATOM_FORCE_CPU", "0") == "1" or not torch.cuda.is_available():
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    dist.barrier()
+    if not int(flag.item()):
+        raise SystemExit(
+            "rank 0 could not produce a complete, verified corpus; "
+            "see the [data] lines above"
+        )
 
 
 def build_loaders(config: dict, rank: int, world_size: int):
