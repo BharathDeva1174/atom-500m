@@ -277,8 +277,17 @@ class Atom500M(nn.Module):
     ) -> torch.Tensor:
         """idx: (B, T) int64 token ids. Returns loss if targets given, else logits.
 
-        Targets are shifted internally: logits[:, :-1] predicts targets[:, 1:].
-        Pass targets as the *unshifted* next-token block (i.e. the same length T).
+        `targets` are ALREADY aligned with `idx`: targets[:, i] is the token
+        that follows idx[:, i], the same length T. The datasets build exactly
+        that (x = chunk[:-1], y = chunk[1:]), so the loss is computed straight
+        through -- logits[:, i] against targets[:, i].
+
+        An earlier version shifted again here, so at position i it trained the
+        model to predict targets[:, i+1] -- the token TWO ahead. Every
+        checkpoint from that run produces word salad when sampled normally:
+        it scored ~3.9 on its own objective and 8.7 (near-random) on real
+        next-token prediction. Do not shift targets again here; if a caller
+        hands over unshifted targets, that caller is the bug.
 
         `start_pos` is the absolute position of `idx[:, 0]`. It is 0 for training
         and for a fresh prompt, and grows only when `generate` slides its window
@@ -321,9 +330,11 @@ class Atom500M(nn.Module):
         if targets is None:
             return logits
 
+        # targets[:, i] is already the token after idx[:, i] (see docstring).
+        # Shifting here as well trained a two-token-ahead predictor.
         loss = F.cross_entropy(
-            logits[:, :-1, :].reshape(-1, self.vocab_size),
-            targets[:, 1:].reshape(-1),
+            logits.reshape(-1, self.vocab_size),
+            targets.reshape(-1),
             ignore_index=-100,  # lets the dataset mask out prompt tokens
         )
         return loss
@@ -359,6 +370,21 @@ if __name__ == "__main__":
     print(f"  dummy input shape  : {tuple(idx.shape)}")
     print(f"  logits shape       : {tuple(logits.shape)}")
     print(f"  cross-entropy loss : {loss.item():.4f}  (ln(V) = {math.log(cfg['vocab_size']):.4f})")
+
+    # The loss must align logits[:, i] with targets[:, i]. The datasets already
+    # align y to x (y = chunk[1:]); shifting again inside forward trains a
+    # two-token-ahead predictor that scores well on its own objective and
+    # generates word salad when sampled normally. Pin the arithmetic.
+    with torch.no_grad():
+        aligned = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, cfg["vocab_size"]), targets.reshape(-1))
+        shifted = torch.nn.functional.cross_entropy(
+            logits[:, :-1].reshape(-1, cfg["vocab_size"]),
+            targets[:, 1:].reshape(-1))
+    ok = abs(loss.item() - aligned.item()) < 1e-5
+    print(f"  loss alignment     : {'logits[:,i] vs targets[:,i]' if ok else 'MISALIGNED'}"
+          f"  (a second shift would give {shifted.item():.4f})")
+    assert ok, "forward shifts targets that the dataset already aligned"
     print("=" * 62)
 
     # --- Parameter budget: how the shipped config splits down --------------

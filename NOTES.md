@@ -131,7 +131,53 @@ confirming the check goes red — a guard that cannot fail is worse than none.
 
 ---
 
-## 5. Checkpoint format and weight tying
+## 5. The target shift must happen exactly once
+
+The datasets hand the model already-aligned targets: `x = chunk[:-1]`,
+`y = chunk[1:]`, so `y[i]` is the token after `x[i]`. `forward` therefore
+compares `logits[:, i]` against `targets[:, i]` **directly**.
+
+An earlier version shifted a second time (`logits[:, :-1]` vs `targets[:, 1:]`),
+so at position *i* the model was trained to predict `targets[:, i+1]` — the
+token **two** ahead. Nothing crashed. The loss looked plausible (it fell from
+6.2 to ~2.1, and eval tracked it down to 3.86 over 3,000 steps), and 3,557
+optimizer steps on Kaggle GPUs went into it.
+
+It was caught by `scripts/generate.py`, which sampled from a checkpoint and got
+word salad. The diagnostic that settled it: evaluate the trained weights under
+both conventions on a real corpus chunk.
+
+| convention | loss on a real chunk |
+|---|---|
+| shift-in-model (what the run optimized) | **3.98** (checkpoint logged 3.85) |
+| correct next-token | **8.73** (near-random; ln V = 10.8) |
+
+A loss measured under the same mistake cannot see the mistake. Every checkpoint
+from that run (steps 500–3000) is a two-token-ahead predictor and generates
+incoherent text when sampled normally.
+
+Two guards now exist, because "the loss is fine" is exactly the failure mode
+being guarded against:
+
+- `src/model.py`'s self-test asserts the loss equals the straight-through
+  cross-entropy and prints what a second shift *would* have scored.
+- `scripts/integration_test.py` pins the same contract on a real batch from
+  `PretokenizedDataset`, so the model's arithmetic and the dataset's alignment
+  are checked together rather than each in isolation.
+
+The proof that the corrected objective is a real language model: overfit a small
+model on one 2,048-token chunk (loss → 0.004) and greedy sampling reproduces the
+true continuation at **100% next-token accuracy**, in the corpus's own
+`Situation/Person/Listener` layout.
+
+The general lesson is worth stating plainly, because two of the bugs in this log
+have the same shape: **a metric computed with the same mistake as the thing it
+measures reports a healthy number.** Eval loss validated the training loss;
+it could not validate the objective.
+
+---
+
+## 6. Checkpoint format and weight tying
 
 `save_and_push_checkpoint` writes a single `.pt` containing model + optimizer +
 step + config.
@@ -156,7 +202,7 @@ proceeds believing a resume point exists.
 
 ---
 
-## 6. Hugging Face target
+## 7. Hugging Face target
 
 Checkpoints upload to **`siddhu1174/atom-500m`** (`HF_REPO_ID`, overridable).
 The Kaggle cell still *clones* from `github.com/BharathDeva1174/atom-500m` —
@@ -165,7 +211,7 @@ asserted by tests so a rename cannot silently break one without the other.
 
 ---
 
-## 7. What is NOT here
+## 8. What is NOT here
 
 Flagging these explicitly so their absence reads as a decision, not an oversight:
 
@@ -187,7 +233,7 @@ Flagging these explicitly so their absence reads as a decision, not an oversight
 
 ---
 
-## 8. Verified
+## 9. Verified
 
 `python scripts/integration_test.py` — 50 checks on CPU:
 
@@ -197,6 +243,8 @@ Flagging these explicitly so their absence reads as a decision, not an oversight
 - Shipped config lands in the 495M–500M band
 - `generate()` respects the position budget and preserves the prompt
 - Dataset windowing: `y[:-1] == x[1:]`, correct offsets, dtype widening
+- Loss alignment: `forward` consumes the dataset's targets with no second shift
+  (§5) — asserted here and in `src/model.py`'s self-test
 - LR schedule: warmup peak, monotonic cosine decay, floors at `MIN_LR`
 - Optimizer param groups: LayerNorm/embedding excluded from decay
 - Deadlock guard and weight-tying round-trip (both mutation-tested)

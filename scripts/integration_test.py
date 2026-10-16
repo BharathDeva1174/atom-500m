@@ -246,6 +246,31 @@ def test_dataset_against_real_file(tmp):
     check("x starts at offset", int(item["x"][0]) == 10 * 100, str(int(item["x"][0])))
     check("y is x shifted", torch.equal(item["y"][:-1], item["x"][1:]))
 
+    # The model must consume those already-aligned targets without shifting
+    # them again. Shifting twice trains a two-token-ahead predictor: the run
+    # scores ~3.9 on that objective, ~8.7 on real next-token prediction, and
+    # generates word salad. The datasets already do the shift, so the model's
+    # loss has to be the straight-through cross-entropy.
+    small_cfg = {"vocab_size": 512, "d_model": 64, "n_head": 4, "n_layer": 2,
+                 "block_size": 100, "ff_expansion": 2.0}
+    m = Atom500M(small_cfg).eval()
+    in_vocab = PretokenizedDataset((np.arange(1200) % 500).astype(np.int64),
+                                   block_size=100)
+    pair = in_vocab[3]
+    with torch.no_grad():
+        logits = m(pair["x"][None])
+        straight = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, small_cfg["vocab_size"]),
+            pair["y"].reshape(-1))
+        again = torch.nn.functional.cross_entropy(
+            logits[:, :-1].reshape(-1, small_cfg["vocab_size"]),
+            pair["y"][1:].reshape(-1))
+        got = m(pair["x"][None], pair["y"])
+    check("model loss uses targets as given (no second shift)",
+          abs(got.item() - straight.item()) < 1e-5,
+          f"{got.item():.4f} vs {straight.item():.4f} "
+          f"(double-shift would be {again.item():.4f})")
+
     # uint16 downcast path
     small = (np.arange(5000) % 1000).astype(np.uint16)
     ds16 = PretokenizedDataset(small, block_size=100)
