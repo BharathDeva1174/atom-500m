@@ -322,7 +322,16 @@ def main() -> None:
                          "pass --prompt or --interactive")
 
     person = args.prompt or input("Person: ").strip()
-    context = format_turn(args.situation, person)
+    # --prompt may be either the Person's words or a whole context block
+    # ("Situation: ...\nPerson: ...\nListener:"). If it already carries the
+    # dialogue markers, pass it through untouched rather than nesting it
+    # inside a second Situation/Person pair.
+    if ("Listener:" in person or person.lstrip().startswith("Situation:")) \
+            and not args.situation:
+        context = person if person.rstrip().endswith("Listener:") \
+            else person.rstrip() + "\nListener:"
+    else:
+        context = format_turn(args.situation, person)
     print(f"\n--- prompt ---\n{context}\n--- reply ---")
     reply = generate_reply(
         model, enc, context,
