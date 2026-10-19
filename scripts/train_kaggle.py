@@ -1028,7 +1028,10 @@ def main() -> None:
         for epoch in range(start_epoch, 10_000 if not MAX_STEPS else start_epoch + 1):
             sampler.set_epoch(epoch)
             ddp_model.train()
-            running = t0 = 0.0
+            # t0 is a wall-clock stamp, not a counter to zero: seeding it with
+            # 0.0 makes dt the time since the Unix epoch, so the rate rounds to
+            # "0 tok/s" no matter how fast the run actually is.
+            running, t0 = 0.0, time.time()
             optimizer.zero_grad(set_to_none=True)
 
             start_it = skip_micro if epoch == start_epoch else 0
@@ -1076,7 +1079,7 @@ def main() -> None:
                     log(f"step {step}/{total_steps:,} | loss {avg:.4f} | "
                         f"lr {optimizer.param_groups[0]['lr']:.2e} | "
                         f"{rate} | {mem}")
-                    running = t0 = 0.0
+                    running, t0 = 0.0, time.time()
 
                 if step % EVAL_EVERY == 0:
                     latest_eval_loss = evaluate(ddp_model, eval_loader, device,
